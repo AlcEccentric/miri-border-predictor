@@ -38,14 +38,8 @@ def upload_predictions_to_r2(
     uploaded_count = 0
     for idol_id, borders_data in results.items():
         for border, result_dict in borders_data.items():
-            # Inject event name into metadata
-            if 'metadata' in result_dict:
-                result_dict['metadata']['name'] = event_name
-            
-            # Convert to JSON
             json_data = json.dumps(result_dict, indent=2)
-            
-            # Upload to R2
+
             file_key = f'prediction/{idol_id}/{border}/predictions.json'
             try:
                 r2_client.put_object(
@@ -55,7 +49,7 @@ def upload_predictions_to_r2(
                     ContentType='application/json'
                 )
                 uploaded_count += 1
-                logging.debug(f"Uploaded prediction for idol {idol_id}, border {border}")
+                logging.info(f"Uploaded prediction for idol {idol_id}, border {border}")
             except Exception as e:
                 logging.error(f"Error uploading prediction for idol {idol_id}, border {border}: {e}", exc_info=True)
     
@@ -278,7 +272,7 @@ def load_anniversary_data_from_r2(
     r2_client: R2Client,
     idol_ids: List[int] = list(range(1, 53)),
     borders: List[int] = [100, 1000],
-    use_local_cache: bool = True,
+    use_local_cache: bool = False,
     local_cache_dir: str = './data_cache'
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Define cache file paths
@@ -370,7 +364,7 @@ def load_latest_event_metadata_from_r2(r2_client: R2Client) -> Dict[str, Any]:
         logging.error(f"Error loading metadata from R2: {e}", exc_info=True)
         raise
 
-def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = True) -> pd.DataFrame:
+def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = False) -> Tuple[pd.DataFrame, Dict[int, str]]:
     logging.info("Loading data from R2...")
 
     target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
@@ -379,9 +373,13 @@ def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = Tr
     else:
         b_info, e_info = load_anniversary_data_from_r2(r2_client, use_local_cache=use_local_cache)
 
+    # Extract event_id to name mapping
+    event_name_map = dict(zip(e_info['event_id'], e_info['name']))
+    logging.info(f"Created event name mapping for {len(event_name_map)} events")
+
     # Combine and process data
     df = combine_info(b_info, e_info)
     df = interpolate(df, metadata['EventId'])    
     df = process_data(df)
 
-    return df
+    return df, event_name_map

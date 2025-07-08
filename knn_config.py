@@ -128,7 +128,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
 
     configs[(5.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=120,
-        mid_stage_end=250,
+        mid_stage_end=220,
         early_stage_k=3,
         mid_stage_k=3,
         late_stage_k=3,

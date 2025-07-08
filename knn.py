@@ -314,7 +314,6 @@ def predict_curve_knn(event_id: float,
     if not historical_trajectories:
         raise ValueError(f"No valid historical trajectories found for step {current_step}")
 
-    should_plot = False
     logging.info(f"Latest score value for current idol: {current_neighbor_data[-1]}")
     distances, similar_ids = find_similar_curves(
         np.array(current_neighbor_data),
@@ -359,6 +358,5 @@ def predict_curve_knn(event_id: float,
             AlignmentMethod.RATIO,
             adapted_lookback,
         )
-
-    logging.info(f"Calculated prediction: {neighbor_prediction[-1]}")
+    logging.info(f"Original predicted score value for current idol: {neighbor_prediction[-1]}")
     return neighbor_prediction, similar_ids, distances

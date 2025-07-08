@@ -55,8 +55,8 @@ def calculate_standard_event_length(df):
     else:
         standard_event_length = int(most_frequent_item)
     
-    logging.info(f"Standard event length (most frequent): {standard_event_length}")
-    logging.info(f"Length distribution: {dict(length_counts.head())}")
+    logging.debug(f"Standard event length (most frequent): {standard_event_length}")
+    logging.debug(f"Length distribution: {dict(length_counts.head())}")
     
     return standard_event_length
 
@@ -83,8 +83,9 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     nf_pdf['time_idx'] = (nf_pdf.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
 
     # debug
-    print(f"Idol 44 max score:", df[(df['event_id'] == metadata['EventId']) & (df['idol_id'] == 44)]['score'].max())
-    print(f"Idol 44 max score:", n_pdf[(n_pdf['event_id'] == metadata['EventId']) & (n_pdf['idol_id'] == 44)]['score'].max())
+    logging.debug(f"Idol 44 max score in df: {df[(df['event_id'] == metadata['EventId']) & (df['idol_id'] == 44)]['score'].max()}")
+    logging.debug(f"Idol 44 max score in pdf: {pdf[(pdf['event_id'] == metadata['EventId']) & (pdf['idol_id'] == 44)]['score'].max()}")
+    logging.debug(f"Idol 44 max score in n_pdf: {n_pdf[(n_pdf['event_id'] == metadata['EventId']) & (n_pdf['idol_id'] == 44)]['score'].max()}")
 
     # Smoothing
     logging.info("Generating smoothed data...")
@@ -102,7 +103,7 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     logging.info("Data preparation pipeline completed")
     return new_data
 
-def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, idol_ids: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict) -> Dict:
+def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, idol_ids: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict, event_name_map: Dict) -> Dict:
     """Run the prediction pipeline"""
     logging.info("Starting predictions...")
     
@@ -121,59 +122,11 @@ def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any],
         event_length=norm_event_length,
         norm_event_length=norm_event_length,
         standard_event_length=standard_event_length,
-        eid_to_len_boost_ratio=eid_to_len_boost_ratio
+        eid_to_len_boost_ratio=eid_to_len_boost_ratio,
+        event_name_map=event_name_map,
     )
     
     logging.info("Predictions completed")
-    return results
-
-def main():
-    logging.info("Starting border prediction pipeline...")
-    
-    r2_client = R2Client()
-    metadata = load_latest_event_metadata_from_r2(r2_client=r2_client)
-    
-    if should_skip_prediction(metadata):
-        logging.info("Prediction skipped due to timing constraints.")
-        return
-    
-    target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
-    logging.info(f"Event type: {target}")
-
-    # Parameters
-    norm_event_length = 300
-    borders = [100.0, 1000.0] if target == 'anniversary' else [100.0, 2500.0]
-    idol_ids = [44] if target == 'anniversary' else [0] # change to full idol list
-    logging.info(f"Using borders: {borders}")
-
-    # Load data and calculate parameters
-    df = load_all_data(r2_client, metadata, use_local_cache=True)
-    
-    eid_to_len_boost_ratio = get_len_and_boost_ratio(df, metadata['EventId'])
-    standard_event_length = calculate_standard_event_length(df)
-    logging.info(f"Standard event length: {standard_event_length}")
-
-    # Debug: Check current event parameters
-    current_event_key = (metadata['EventId'], 1)  # Using idol_id=1 as example
-    if current_event_key in eid_to_len_boost_ratio:
-        current_params = eid_to_len_boost_ratio[current_event_key]
-        logging.info(f"Current event parameters: length={current_params['length']}, boost_ratio={current_params['boost_ratio']}")
-    else:
-        logging.warning(f"No parameters found for current event {metadata['EventId']}")
-    
-    current_step = get_current_step(norm_event_length, metadata['StartAt'], metadata['EndAt'])
-    logging.info(f"Current step: {current_step}/{norm_event_length}")
-
-    new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
-
-    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio)
-
-    if results:
-        upload_predictions_to_r2(r2_client, results, metadata['EventId'])
-        logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
-    else:
-        logging.warning("No results to upload")
-
     return results
 
 def get_len_and_boost_ratio(df: pd.DataFrame, current_event_id: int) -> Dict[Tuple[int, int], Dict[str, Any]]:
@@ -230,15 +183,58 @@ def check_event_length(target, df):
             logging.warning(f"  Length {length}: {count} groups")
         raise ValueError(f"Anniversary data has inconsistent group lengths: {sorted(unique_lengths)}")
 
-def get_current_step(norm_event_length: int, event_start_str: str, event_end_str: str) -> int:
+def get_current_step(norm_event_length: int, metadata: Dict[str, Any], df: pd.DataFrame) -> int:
     """Calculate current step based on event progress"""
-    jst = pytz.timezone('Asia/Tokyo')
-    event_start_time = parser.isoparse(event_start_str)
-    event_end_time = parser.isoparse(event_end_str)
-    current_time = datetime.datetime.now(jst)
+    current_data = df[(df['event_id'] == metadata['EventId'])]
     
+    event_start_time = parser.isoparse(metadata['StartAt'])
+    event_end_time = parser.isoparse(metadata['EndAt'])
+    current_time = current_data['aggregated_at'].max()
+    logging.debug(f"Latest aggregated at: {current_data['aggregated_at'].max()}, event start time: {event_start_time}, event end time: {event_end_time}, current time: {current_time}")
     current_step = int((current_time - event_start_time).total_seconds() * norm_event_length / (event_end_time - event_start_time).total_seconds())
+    logging.debug(f"Current step: {current_step}")
     return current_step
+
+def main():
+    logging.info("Starting border prediction pipeline...")
+    
+    r2_client = R2Client()
+    metadata = load_latest_event_metadata_from_r2(r2_client=r2_client)
+    
+    if should_skip_prediction(metadata):
+        logging.info("Prediction skipped due to timing constraints.")
+        return
+    
+    target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
+    logging.info(f"Event type: {target}")
+
+    # Parameters
+    norm_event_length = 300
+    borders = [100.0, 1000.0] if target == 'anniversary' else [100.0, 2500.0]
+    idol_ids = list(range(1, 53)) if target == 'anniversary' else [0]
+    logging.info(f"Using borders: {borders}")
+
+    # Load data and calculate parameters
+    df, event_name_map = load_all_data(r2_client, metadata, use_local_cache=False)
+    
+    eid_to_len_boost_ratio = get_len_and_boost_ratio(df, metadata['EventId'])
+    standard_event_length = calculate_standard_event_length(df)
+    
+    current_step = get_current_step(norm_event_length, metadata, df)
+    logging.info(f"Current step: {current_step}/{norm_event_length}")
+
+    new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
+
+    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio, event_name_map)
+
+    if results:
+        upload_predictions_to_r2(r2_client, results, metadata['EventId'])
+        logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
+    else:
+        logging.warning("No results to upload")
+
+    return results
+
 
 if __name__ == "__main__":
     main()
