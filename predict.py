@@ -64,7 +64,7 @@ def build_result_dict(
             "idol_id": int(neighbor_iid),
             "name": neighbor_name
         }
-        result["data"]["normalized"]["neighbors"][str(i+1)] = neighbor_norm_data.tolist()
+        result["data"]["normalized"]["neighbors"][str(i+1)] = [round(x) for x in neighbor_norm_data.tolist()]
         neighbor_norm_full_curves.append(neighbor_norm_data)
 
     target_norm_final_value = smoothed_prediction[-1]
@@ -107,20 +107,26 @@ def build_result_dict(
                 norm_gap = first_predicted_norm_check - last_known_norm_check
                 logging.debug(f"Normalized gap for idol {idol_id}, border {border}: last_known={last_known_norm_check}, first_predicted={first_predicted_norm_check}, gap={norm_gap}")
                 
+                if abs(norm_gap) > 1e-10:
+                    logging.error(f"CRITICAL: Non-zero gap in normalized data: {norm_gap}")
+                    logging.error(f"  This violates requirement #1: slice point gap should be 0")
+                else:
+                    logging.debug(f"✓ No gap in normalized data at slice point")
+                
                 # Log final values for verification
                 logging.debug(f"Normalized final value: {normalized_target[-1]}")
                 logging.debug(f"Target normalized final value: {target_norm_final_value}")
                 
-                if abs(norm_gap) > 1e-10:
-                    logging.warning(f"Non-zero gap detected in normalized data: {norm_gap}")
                 if abs(normalized_target[-1] - target_norm_final_value) > 1e-10:
-                    logging.warning(f"Final value mismatch: got {normalized_target[-1]}, expected {target_norm_final_value}")
+                    logging.error(f"CRITICAL: Final value mismatch: got {normalized_target[-1]}, expected {target_norm_final_value}")
+                else:
+                    logging.debug(f"✓ Normalized final value matches target: {normalized_target[-1]}")
         else:
             raise ValueError(f"Insufficient data for idol {idol_id} at border {border} for event {event_id}")
     else:
         raise ValueError(f"No current normalized data for idol {idol_id} at border {border} for event {event_id}")
 
-    result["data"]["normalized"]["target"] = normalized_target.tolist()
+    result["data"]["normalized"]["target"] = [round(x) for x in normalized_target.tolist()]
 
     raw_target = denormalize_target_to_raw(
         normalized_target=normalized_target,
@@ -139,9 +145,12 @@ def build_result_dict(
         logging.debug(f"Raw gap for idol {idol_id}, border {border}: last_known={last_known_raw}, first_predicted={first_predicted_raw}, gap={raw_gap}")
         
         if abs(raw_gap) > 1e-10:
-            logging.warning(f"Non-zero gap detected in raw data: {raw_gap}")
+            logging.error(f"CRITICAL: Non-zero gap in raw data: {raw_gap}")
+            logging.error(f"  This violates requirement #1: slice point gap should be 0")
+        else:
+            logging.debug(f"✓ No gap in raw data at slice point")
 
-    result["data"]["raw"]["target"] = raw_target.tolist()
+    result["data"]["raw"]["target"] = [round(x) for x in raw_target.tolist()]
     
     # Final consistency check: compare normalized and denormalized final values
     norm_final = normalized_target[-1]
@@ -149,24 +158,30 @@ def build_result_dict(
     
     # For no score scaling case, these should be exactly equal
     scale_factor = standard_event_length / full_event_length
+    logging.debug(f"Final value check - scale_factor: {scale_factor}, norm_final: {norm_final}, raw_final: {raw_final}")
+    
     if abs(scale_factor - 1.0) < 1e-10:
+        # No scaling case - values should be identical
         if abs(norm_final - raw_final) > 1e-10:
-            logging.warning(f"Final value mismatch (no scaling case): normalized={norm_final}, denormalized={raw_final}, diff={abs(norm_final - raw_final)}")
+            logging.error(f"CRITICAL: Final value mismatch (no scaling case): normalized={norm_final}, denormalized={raw_final}, diff={abs(norm_final - raw_final)}")
+            logging.error(f"  This violates requirement #2: norm and denorm final values should be the same")
         else:
-            logging.debug(f"Final values match perfectly (no scaling): {norm_final}")
+            logging.debug(f"✓ Final values match perfectly (no scaling): {norm_final}")
     else:
+        # With scaling - raw should equal norm/scale_factor
         expected_raw_final = norm_final / scale_factor
         if abs(raw_final - expected_raw_final) > 1e-10:
-            logging.warning(f"Final value mismatch (with scaling): normalized={norm_final}, denormalized={raw_final}, expected={expected_raw_final}")
+            logging.error(f"CRITICAL: Final value mismatch (with scaling): normalized={norm_final}, denormalized={raw_final}, expected={expected_raw_final}")
+            logging.error(f"  Scale factor: {scale_factor}, diff: {abs(raw_final - expected_raw_final)}")
         else:
-            logging.debug(f"Final values consistent with scaling: norm={norm_final}, raw={raw_final}, scale={scale_factor}")
+            logging.debug(f"✓ Final values consistent with scaling: norm={norm_final}, raw={raw_final}, scale={scale_factor}")
     
     logging.info(f"Prediction summary for idol {idol_id} at border {border} for event {event_id}")
-    logging.info(f"=>Normalized prediction {result["data"]["normalized"]["target"][-1]} with length {len(result['data']['normalized']['target'])}")
-    logging.info(f"=>Denormalized prediction {result['data']['raw']['target'][-1]} with length {len(result['data']['raw']['target'])}")
+    logging.info(f"=>Normalized prediction {round(result['data']['normalized']['target'][-1])} with length {len(result['data']['normalized']['target'])}")
+    logging.info(f"=>Denormalized prediction {round(result['data']['raw']['target'][-1])} with length {len(result['data']['raw']['target'])}")
     logging.info(f"=>Neighbors:")
     for i, neighbor in enumerate(result["metadata"]["normalized"]["neighbors"].values()):
-        logging.info(f"=>{neighbor['id']} {neighbor['idol_id']} {result['data']['normalized']['neighbors'][str(i+1)][-1]}")
+        logging.info(f"=>{neighbor['id']} {neighbor['idol_id']} {round(result['data']['normalized']['neighbors'][str(i+1)][-1])}")
 
     return result
 

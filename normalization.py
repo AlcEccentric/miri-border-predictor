@@ -176,34 +176,37 @@ def denormalize_consistently(normalized_scores, full_norm_length, target_length,
         logging.debug(f"Normalized final value: {normalized_scores[-1]}")
         return normalized_scores.copy()
     
-    # Step 2: Expand temporal resolution (inverse of the sampling done in normalization)
+    # Step 2: Expand temporal resolution using clean approach
     if need_temporal_expansion:
-        target_boost_ratio = 0.55
-        target_boost_step = int(target_boost_ratio * full_norm_length)  # 165 for 300
+        # Get the normalized future part (entire curve)
+        norm_future_part = normalized_scores.copy()
         
-        if actual_boost_start is not None and target_length > actual_boost_start:
-            # Handle boost timing - need to map normalized indices back to raw indices
-            raw_indices = []
-            
-            for raw_idx in range(target_length):
-                if raw_idx < actual_boost_start:
-                    # Pre-boost section: map raw_idx to normalized space
-                    norm_idx = raw_idx * target_boost_step / actual_boost_start
-                else:
-                    # Post-boost section
-                    post_boost_raw_idx = raw_idx - actual_boost_start
-                    post_boost_length = target_length - actual_boost_start
-                    post_boost_norm_length = full_norm_length - target_boost_step
-                    norm_idx = target_boost_step + (post_boost_raw_idx * post_boost_norm_length / post_boost_length)
-                
-                raw_indices.append(min(norm_idx, full_norm_length - 1))
-            
-            # Interpolate normalized scores to raw temporal resolution
-            expanded_scores = np.interp(raw_indices, np.arange(len(normalized_scores)), normalized_scores)
+        # Get first and last values
+        first_value = norm_future_part[0]
+        last_value = norm_future_part[-1]
+        
+        # Make it relative by subtracting the first value
+        relative_curve = norm_future_part - first_value
+        
+        # Create extended timeline with target length
+        extended_curve = np.zeros(target_length)
+        
+        # Interpolate the relative curve to target length
+        if len(relative_curve) > 1:
+            norm_indices = np.linspace(0, len(relative_curve) - 1, target_length)
+            extended_relative = np.interp(norm_indices, np.arange(len(relative_curve)), relative_curve)
         else:
-            # Simple linear mapping - interpolate from norm_length to target_length
-            norm_indices = np.linspace(0, len(normalized_scores) - 1, target_length)
-            expanded_scores = np.interp(norm_indices, np.arange(len(normalized_scores)), normalized_scores)
+            extended_relative = np.zeros(target_length)
+        
+        # Add back the first value to get the final smooth curve
+        extended_curve = extended_relative + first_value
+        
+        # Ensure both ends are preserved exactly
+        extended_curve[0] = first_value
+        extended_curve[-1] = last_value
+        
+        expanded_scores = extended_curve
+        logging.debug(f"Temporal expansion: preserved first={first_value}, last={last_value}")
     else:
         expanded_scores = normalized_scores.copy()
     
@@ -226,7 +229,9 @@ def denormalize_consistently(normalized_scores, full_norm_length, target_length,
     # when no score scaling is applied
     if not apply_score_scaling:
         if abs(denormalized_scores[-1] - normalized_scores[-1]) > 1e-10:
-            logging.warning(f"Final value changed during temporal expansion: {normalized_scores[-1]} -> {denormalized_scores[-1]}")
+            logging.error(f"CRITICAL: Final value mismatch (no scaling case): normalized={normalized_scores[-1]}, denormalized={denormalized_scores[-1]}, diff={abs(denormalized_scores[-1] - normalized_scores[-1])}")
+        else:
+            logging.debug(f"✓ Final values match (no scaling case): {denormalized_scores[-1]}")
     
     return denormalized_scores
 
@@ -255,15 +260,40 @@ def denormalize_target_to_raw(normalized_target, current_raw_data, full_norm_len
         
         # Ensure continuity: if there's a future part, make sure it starts from the last known value
         if known_length < len(result) and known_length > 0:
-            # Check the gap at the transition point
-            last_known_raw = result[known_length - 1]
-            first_predicted_raw = result[known_length]
-            gap = first_predicted_raw - last_known_raw
+            # Get the future part that needs to be smoothed
+            future_part = result[known_length:].copy()
+            last_known = result[known_length - 1]
+            future_final = future_part[-1]
             
-            if abs(gap) > 1e-10:
-                logging.debug(f"Adjusting denormalized prediction to eliminate gap: {gap}")
-                # Shift the entire future part to ensure continuity
-                result[known_length:] -= gap
+            # Apply the same smooth scaling approach:
+            # 1. Make future part relative by subtracting first value
+            future_first = future_part[0]
+            relative_future = future_part - future_first
+            
+            # 2. Scale to match the desired gap (from last_known to future_final)
+            if len(relative_future) > 1:
+                original_range = relative_future[-1] - relative_future[0]  # Should be 0 since we subtracted first
+                target_range = future_final - last_known
+                
+                # Scale the relative curve to match target range
+                if abs(original_range) > 1e-10:
+                    scale_factor = target_range / original_range
+                    scaled_relative = relative_future * scale_factor
+                else:
+                    # If original range is 0, create linear interpolation
+                    scaled_relative = np.linspace(0, target_range, len(relative_future))
+                
+                # 3. Add back the offset (last_known) to get final smooth curve
+                smooth_future = scaled_relative + last_known
+                
+                # Ensure exact continuity
+                smooth_future[0] = last_known
+                smooth_future[-1] = future_final
+                
+                result[known_length:] = smooth_future
+            else:
+                # Single point case
+                result[known_length] = last_known
         
         logging.debug(f"Raw denormalization summary:")
         logging.debug(f"  Known data length: {len(current_raw_data)}")
@@ -274,6 +304,14 @@ def denormalize_target_to_raw(normalized_target, current_raw_data, full_norm_len
         if len(result) > len(current_raw_data):
             logging.debug(f"  First predicted raw value: {result[len(current_raw_data)]}")
             logging.debug(f"  Final raw value: {result[-1]}")
+            
+            # Check for continuity
+            if len(current_raw_data) > 0:
+                gap = result[len(current_raw_data)] - current_raw_data[-1]
+                if abs(gap) > 1e-10:
+                    logging.error(f"CRITICAL: Gap in raw data at slice point: {gap}")
+                else:
+                    logging.debug(f"✓ No gap in raw data at slice point")
         
         return result
     else:
