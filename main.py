@@ -4,6 +4,10 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 from dateutil import parser
 import pytz
+
+# Import logger configuration first
+import logger_config
+
 from loader import load_all_data, load_latest_event_metadata_from_r2, upload_predictions_to_r2
 from data_processing import purge
 from predict import get_predictions
@@ -66,7 +70,7 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     
     # Normalize partial event data till current step
     logging.info("Normalizing partial event data...")
-    pdf = purge(df, current_step, norm_event_length)
+    pdf = purge(df, current_step, norm_event_length, eid_to_len_boost_ratio)
     n_pdf = do_normalize(pdf, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
 
     # Feature engineering
@@ -77,6 +81,10 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     norm_feature_df['time_idx'] = (norm_feature_df.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
     nf_pdf = add_additional_features(n_pdf)
     nf_pdf['time_idx'] = (nf_pdf.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
+
+    # debug
+    print(f"Idol 44 max score:", df[(df['event_id'] == metadata['EventId']) & (df['idol_id'] == 44)]['score'].max())
+    print(f"Idol 44 max score:", n_pdf[(n_pdf['event_id'] == metadata['EventId']) & (n_pdf['idol_id'] == 44)]['score'].max())
 
     # Smoothing
     logging.info("Generating smoothed data...")
@@ -94,7 +102,7 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     logging.info("Data preparation pipeline completed")
     return new_data
 
-def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict) -> Dict:
+def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, idol_ids: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict) -> Dict:
     """Run the prediction pipeline"""
     logging.info("Starting predictions...")
     
@@ -107,7 +115,7 @@ def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any],
         event_id=metadata['EventId'],
         event_type=metadata['EventType'],
         sub_types=internal_event_type_to_sub_types[metadata['InternalEventType']],
-        idol_ids=list(range(1, 53)),
+        idol_ids=idol_ids,
         borders=borders,
         step=current_step,
         event_length=norm_event_length,
@@ -135,22 +143,31 @@ def main():
     # Parameters
     norm_event_length = 300
     borders = [100.0, 1000.0] if target == 'anniversary' else [100.0, 2500.0]
+    idol_ids = [44] if target == 'anniversary' else [0] # change to full idol list
     logging.info(f"Using borders: {borders}")
 
     # Load data and calculate parameters
-    df = load_all_data(r2_client, metadata)
-    eid_to_len_boost_ratio = get_len_and_boost_ratio(df)
+    df = load_all_data(r2_client, metadata, use_local_cache=True)
+    
+    eid_to_len_boost_ratio = get_len_and_boost_ratio(df, metadata['EventId'])
     standard_event_length = calculate_standard_event_length(df)
+    logging.info(f"Standard event length: {standard_event_length}")
+
+    # Debug: Check current event parameters
+    current_event_key = (metadata['EventId'], 1)  # Using idol_id=1 as example
+    if current_event_key in eid_to_len_boost_ratio:
+        current_params = eid_to_len_boost_ratio[current_event_key]
+        logging.info(f"Current event parameters: length={current_params['length']}, boost_ratio={current_params['boost_ratio']}")
+    else:
+        logging.warning(f"No parameters found for current event {metadata['EventId']}")
+    
     current_step = get_current_step(norm_event_length, metadata['StartAt'], metadata['EndAt'])
     logging.info(f"Current step: {current_step}/{norm_event_length}")
 
-    # Prepare data pipeline
     new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
 
-    # Run predictions
-    results = run_predictions(new_data, metadata, borders, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio)
+    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio)
 
-    # Upload results to R2
     if results:
         upload_predictions_to_r2(r2_client, results, metadata['EventId'])
         logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
@@ -159,18 +176,46 @@ def main():
 
     return results
 
-def get_len_and_boost_ratio(df: pd.DataFrame) -> Dict[Tuple[int, int], Dict[str, Any]]:
+def get_len_and_boost_ratio(df: pd.DataFrame, current_event_id: int) -> Dict[Tuple[int, int], Dict[str, Any]]:
     eid_to_len_boost_ratio = {}
-    for event_id in df['event_id'].unique():
-        for idol_id in df['idol_id'].unique():
-            edf = df[(df['event_id'] == event_id) & (df['idol_id'] == idol_id)]
-            if len(edf) > 0:
-                boost_start = edf.reset_index().index[edf['is_boosted'] == True][0] if True in edf['is_boosted'].values else None
-                eid_to_len_boost_ratio[(event_id, idol_id)] = {
-                    'boost_ratio': boost_start/len(edf) if boost_start else None,
-                    'length': len(edf),
+    
+    # Get current event type info
+    current_event_data = df[df['event_id'] == current_event_id]
+    current_event_type = current_event_data['event_type'].iloc[0] if len(current_event_data) > 0 else None
+    current_internal_event_type = current_event_data['internal_event_type'].iloc[0] if len(current_event_data) > 0 else None
+    
+    # Find template event (most recent similar event with same event type and internal event type)
+    template_params = None
+    if current_event_type is not None:
+        similar_events = df[(df['event_id'] != current_event_id) & (df['event_type'] == current_event_type) & (df['internal_event_type'] == current_internal_event_type)]
+        if len(similar_events) > 0:
+            template_event_id = similar_events['event_id'].max()
+            template_idol_id = similar_events[similar_events['event_id'] == template_event_id]['idol_id'].max()
+            template_data = similar_events[(similar_events['event_id'] == template_event_id) & (similar_events['idol_id'] == template_idol_id) & (similar_events['border'] == 100.0)]
+            if len(template_data) > 0:
+                boost_start = template_data.reset_index().index[template_data['is_boosted'] == True][0] if True in template_data['is_boosted'].values else None
+                template_params = {
+                    'boost_ratio': boost_start/len(template_data) if boost_start else None,
+                    'length': len(template_data),
                     'boost_start': boost_start,
                 }
+    
+    # Process all events
+    for event_id in df['event_id'].unique():
+        for idol_id in df['idol_id'].unique():
+            if event_id == current_event_id:
+                # Use template params for current event
+                eid_to_len_boost_ratio[(event_id, idol_id)] = template_params or {'boost_ratio': None, 'length': None, 'boost_start': None}
+            else:
+                # Calculate params for historical events
+                edf = df[(df['event_id'] == event_id) & (df['idol_id'] == idol_id) & (df['border'] == 100.0)]
+                if len(edf) > 0:
+                    boost_start = edf.reset_index().index[edf['is_boosted'] == True][0] if True in edf['is_boosted'].values else None
+                    eid_to_len_boost_ratio[(event_id, idol_id)] = {
+                        'boost_ratio': boost_start/len(edf) if boost_start else None,
+                        'length': len(edf),
+                        'boost_start': boost_start,
+                    }
     return eid_to_len_boost_ratio
 
 def check_event_length(target, df):

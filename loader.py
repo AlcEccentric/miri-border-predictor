@@ -17,11 +17,11 @@ def get_event_name_mapping_from_r2(r2_client: R2Client) -> Dict[int, str]:
         event_obj = r2_client.get_object(BUCKET_NAME, event_file_key)
         event_info = pd.read_csv(StringIO(event_obj['Body'].read().decode('utf-8')))
 
-        event_mapping = dict(zip(event_info['event_id'], event_info['event_name']))
+        event_mapping = dict(zip(event_info['event_id'], event_info['name']))
         logging.info(f"Created event name mapping for {len(event_mapping)} events")
         return event_mapping
     except Exception as e:
-        logging.error(f"Error creating event name mapping: {e}")
+        logging.error(f"Error creating event name mapping: {e}", exc_info=True)
         return {}
 
 def upload_predictions_to_r2(
@@ -57,7 +57,7 @@ def upload_predictions_to_r2(
                 uploaded_count += 1
                 logging.debug(f"Uploaded prediction for idol {idol_id}, border {border}")
             except Exception as e:
-                logging.error(f"Error uploading prediction for idol {idol_id}, border {border}: {e}")
+                logging.error(f"Error uploading prediction for idol {idol_id}, border {border}: {e}", exc_info=True)
     
     logging.info(f"Successfully uploaded {uploaded_count} prediction files to R2 for event: {event_name}")
 
@@ -118,13 +118,16 @@ def _process_anniversary_data(
     idol_ids: List[int],
     borders: List[int]
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Make a copy to avoid SettingWithCopyWarning
+    event_info = event_info.copy()
+    
     event_info['start_at'] = pd.to_datetime(event_info['start_at'])
     event_info['start_date'] = pd.to_datetime(event_info['start_at']).dt.date
     event_info['end_at'] = pd.to_datetime(event_info['end_at']) + pd.Timedelta(seconds=1)
     event_info['boost_at'] = pd.to_datetime(event_info['boost_at'], errors='coerce')
     
-    invalid_date = pd.Timestamp('0001-01-01')
-    valid_mask = (~event_info['boost_at'].isna()) & (event_info['boost_at'] != invalid_date)
+    latest_valid_date = pd.Timestamp('2010-01-01', tz='Asia/Tokyo')
+    valid_mask = (~event_info['boost_at'].isna()) & (event_info['boost_at'] > latest_valid_date)
     valid_event_info = event_info[valid_mask]
     
     if not border_info.empty:
@@ -234,7 +237,7 @@ def load_data_from_r2(
             except r2_client.client.exceptions.NoSuchKey:
                 continue
             except Exception as e:
-                logging.warning(f"Could not load {filename} from R2: {e}")
+                logging.warning(f"Could not load {filename} from R2: {e}", exc_info=True)
     
     if border_dfs:
         border_info = pd.concat(border_dfs, ignore_index=True)
@@ -251,23 +254,62 @@ def load_data_from_r2(
     logging.info(f"Loaded {len(event_info)} events from R2")
     return merged, event_info
 
+def clear_anniversary_cache(local_cache_dir: str = './data_cache') -> None:
+    """Clear the local cache for anniversary data"""
+    border_info_cache_path = os.path.join(local_cache_dir, 'anniversary_border_info.pkl')
+    event_info_cache_path = os.path.join(local_cache_dir, 'anniversary_event_info.pkl')
+    
+    files_removed = 0
+    for cache_path in [border_info_cache_path, event_info_cache_path]:
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+                files_removed += 1
+                logging.info(f"Removed cache file: {cache_path}")
+            except Exception as e:
+                logging.error(f"Failed to remove cache file {cache_path}: {e}", exc_info=True)
+    
+    if files_removed > 0:
+        logging.info(f"Cleared {files_removed} cache files from {local_cache_dir}")
+    else:
+        logging.info("No cache files to clear")
+
 def load_anniversary_data_from_r2(
     r2_client: R2Client,
     idol_ids: List[int] = list(range(1, 53)),
     borders: List[int] = [100, 1000],
+    use_local_cache: bool = True,
+    local_cache_dir: str = './data_cache'
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Define cache file paths
+    border_info_cache_path = os.path.join(local_cache_dir, 'anniversary_border_info.pkl')
+    event_info_cache_path = os.path.join(local_cache_dir, 'anniversary_event_info.pkl')
+    
+    # Try to load from cache if enabled
+    if use_local_cache and os.path.exists(border_info_cache_path) and os.path.exists(event_info_cache_path):
+        try:
+            logging.info("Loading anniversary data from local cache...")
+            border_info = pd.read_pickle(border_info_cache_path)
+            event_info = pd.read_pickle(event_info_cache_path)
+            logging.info(f"Successfully loaded {len(border_info)} border records and {len(event_info)} event records from cache")
+            return border_info, event_info
+        except Exception as e:
+            logging.warning(f"Failed to load from cache, falling back to R2: {e}", exc_info=True)
+    
+    # Load from R2 (original logic)
+    logging.info("Loading anniversary data from R2...")
     event_info_key = 'event_info/event_info_all.csv'
     event_obj = r2_client.get_object(BUCKET_NAME, event_info_key)
     event_info = pd.read_csv(StringIO(event_obj['Body'].read().decode('utf-8')))
     event_ids = event_info[event_info['event_type'] == 5]['event_id'].unique()
 
     event_info['boost_at'] = pd.to_datetime(event_info['boost_at'], errors='coerce')
-    latest_valid_date = pd.Timestamp('2010-01-01')
+    latest_valid_date = pd.Timestamp('2010-01-01', tz='Asia/Tokyo')
     valid_mask = (~event_info['boost_at'].isna()) & (event_info['boost_at'] > latest_valid_date)
     valid_event_info = event_info[valid_mask]
     
     valid_event_ids = set(valid_event_info['event_id'].unique())
-    filtered_event_ids = [eid for eid in event_ids if eid in valid_event_ids]
+    filtered_event_ids = [eid for eid in event_ids if eid in valid_event_ids and eid >= 192] # exclude early anniversary data
     
     logging.info(f"Loading data from R2 for {len(filtered_event_ids)} events (filtered from {len(event_ids)} requested)")
     
@@ -289,7 +331,7 @@ def load_anniversary_data_from_r2(
                 except r2_client.client.exceptions.NoSuchKey:
                     continue
                 except Exception as e:
-                    logging.warning(f"Could not load {filename} from R2: {e}")
+                    logging.warning(f"Could not load {filename} from R2: {e}", exc_info=True)
     
     if border_dfs:
         border_info = pd.concat(border_dfs, ignore_index=True)
@@ -301,6 +343,16 @@ def load_anniversary_data_from_r2(
     border_info, valid_event_info = _process_anniversary_data(
         border_info, valid_event_info, filtered_event_ids, idol_ids, borders
     )
+    
+    # Save to cache if enabled
+    if use_local_cache:
+        try:
+            os.makedirs(local_cache_dir, exist_ok=True)
+            border_info.to_pickle(border_info_cache_path)
+            valid_event_info.to_pickle(event_info_cache_path)
+            logging.info(f"Saved anniversary data to local cache at {local_cache_dir}")
+        except Exception as e:
+            logging.warning(f"Failed to save to cache: {e}", exc_info=True)
     
     return border_info, valid_event_info
 
@@ -315,17 +367,17 @@ def load_latest_event_metadata_from_r2(r2_client: R2Client) -> Dict[str, Any]:
         logging.info(f"Successfully loaded metadata for event {metadata.get('EventId', 'Unknown')}: {metadata.get('EventName', 'Unknown')}")
         return metadata
     except Exception as e:
-        logging.error(f"Error loading metadata from R2: {e}")
+        logging.error(f"Error loading metadata from R2: {e}", exc_info=True)
         raise
 
-def load_all_data(r2_client: R2Client, metadata: Any) -> pd.DataFrame:
+def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = True) -> pd.DataFrame:
     logging.info("Loading data from R2...")
 
     target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
     if target == 'normal':
         b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'])
     else:
-        b_info, e_info = load_anniversary_data_from_r2(r2_client)
+        b_info, e_info = load_anniversary_data_from_r2(r2_client, use_local_cache=use_local_cache)
 
     # Combine and process data
     df = combine_info(b_info, e_info)

@@ -101,7 +101,8 @@ def build_result_dict(
     )
 
     result["data"]["raw"]["target"] = raw_target.tolist()
-
+    logging.info(f"Normalized prediction {result["data"]["normalized"]["target"][-1]} & Denormed prediction {result['data']['raw']['target'][-1]} for idol {idol_id} at border {border} for event {event_id}: ")
+    logging.info(f"Neighbors: {result['metadata']['normalized']['neighbors']}")
     return result
 
 def get_predictions(
@@ -179,7 +180,7 @@ def get_predictions(
                 results[idol_id][border] = result
 
             except Exception as e:
-                logging.error(f"Error processing idol {idol_id}, border {border}: {e}")
+                logging.error(f"Error processing idol {idol_id}, border {border}: {e}", exc_info=True)
                 continue
 
     return results

@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import pandas as pd
 from knn_config import AlignmentMethod, DistanceMetric, get_group_config
@@ -237,7 +238,7 @@ def predict_curve_knn(event_id: float,
                      norm_partial_data: pd.DataFrame,
                      smooth_partial_data: pd.DataFrame,
                      smooth_full_data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-
+    logging.info(f"Running knn for event {event_id}, idol {idol_id}, border {border}, step {current_step}")
     neighbor_partial_norm = norm_partial_data
     neighbor_partial_smooth = smooth_partial_data
     prediction_full_norm = norm_data
@@ -248,10 +249,10 @@ def predict_curve_knn(event_id: float,
     current_trajectory = neighbor_partial_norm[(neighbor_partial_norm['event_id'] == event_id) & (neighbor_partial_norm['idol_id'] == idol_id)]['score'].values
 
     # Early return for minor idols with low scores
-    if len(current_trajectory) > 0 and current_trajectory[-1] < 5000:
+    if len(current_trajectory) == 0 or current_trajectory[-1] < 5000:
         return np.array([]), np.array([]), np.array([])
 
-    event_data = norm_data[(norm_data['event_id'] == event_id) & (norm_data['idol_id'] == idol_id)].iloc[0]
+    event_data = neighbor_partial_norm[(neighbor_partial_norm['event_id'] == event_id) & (neighbor_partial_norm['idol_id'] == idol_id)].iloc[0]
     event_type = event_data['event_type']
     config = get_group_config(event_type, sub_types, border)
     
@@ -314,6 +315,7 @@ def predict_curve_knn(event_id: float,
         raise ValueError(f"No valid historical trajectories found for step {current_step}")
 
     should_plot = False
+    logging.info(f"Latest score value for current idol: {current_neighbor_data[-1]}")
     distances, similar_ids = find_similar_curves(
         np.array(current_neighbor_data),
         [h[:current_step] for h in historical_trajectories],
@@ -358,4 +360,5 @@ def predict_curve_knn(event_id: float,
             adapted_lookback,
         )
 
+    logging.info(f"Calculated prediction: {neighbor_prediction[-1]}")
     return neighbor_prediction, similar_ids, distances

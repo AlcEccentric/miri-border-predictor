@@ -53,15 +53,16 @@ def combine_info(
 
     return all_data.sort_values('aggregated_at')
 
-def purge(df, step, norm_event_length):
+def purge(df, step, norm_event_length, eid_to_len_boost_ratio):
     df = df.copy()
     keep_percentage = step / norm_event_length
     processed_groups = []
     
-    for (_, _, _), group in df.groupby(['event_id', 'idol_id', 'border']):
+    for (eid, iid, _), group in df.groupby(['event_id', 'idol_id', 'border']):
         
         group_sorted = group.sort_values('aggregated_at')
-        rows_to_keep = max(1, int(len(group_sorted) * keep_percentage))
+        full_event_length = eid_to_len_boost_ratio[(eid, iid)]['length']
+        rows_to_keep = max(1, int(full_event_length * keep_percentage))
         kept_rows = group_sorted.head(rows_to_keep)
         processed_groups.append(kept_rows)
     

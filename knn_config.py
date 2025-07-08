@@ -86,7 +86,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_use_smooth_for_prediction=True
     )
     
-    configs[(3.0, 2.0, 100.0)] = GroupConfig(
+    configs[(3.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=240,
         early_stage_k=6,
@@ -126,7 +126,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_use_smooth_for_prediction=True
     )
 
-    configs[(5.0, 1.0, 100.0)] = GroupConfig(
+    configs[(5.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=120,
         mid_stage_end=250,
         early_stage_k=3,
@@ -160,7 +160,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     )
 
 
-    configs[(5.0, 1.0, 1000.0)] = GroupConfig(
+    configs[(5.0, (1.0,), 1000.0)] = GroupConfig(
         early_stage_end=90,
         mid_stage_end=190,
         early_stage_k=3,  
