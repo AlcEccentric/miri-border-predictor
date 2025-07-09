@@ -26,7 +26,7 @@ class GroupConfig:
     
     early_stage_lookback: int = 40
     mid_stage_lookback: int = 30
-    late_stage_lookback: int = 15    
+    late_stage_lookback: int = 23    
 
     early_stage_metric: DistanceMetric = DistanceMetric.RMSE
     mid_stage_metric: DistanceMetric = DistanceMetric.RMSE
