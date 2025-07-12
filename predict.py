@@ -100,24 +100,32 @@ def build_result_dict(
             for neighbor_curve in neighbor_norm_full_curves:
                 if len(neighbor_curve) == norm_event_length and len(neighbor_curve) > len(current_norm_data):
                     neighbor_future = neighbor_curve[len(current_norm_data):]
-                    neighbor_incr_rates.append(np.diff(neighbor_future, prepend=neighbor_future[0]))
+                    # Calculate rates: first rate is from last_known to first_future, then diff between consecutive futures
+                    neighbor_last_known = neighbor_curve[len(current_norm_data)-1] if len(current_norm_data) > 0 else 0
+                    rates = np.diff(neighbor_future, prepend=neighbor_last_known)
+                    neighbor_incr_rates.append(rates)
             neighbor_incr_rates = np.array(neighbor_incr_rates)  # shape: (n_neighbors, remaining_steps)
 
             # Calculate weighted average trajectory's increasing rates
-            avg_incr_rate = np.diff(predicted_norm_part, prepend=predicted_norm_part[0])
+            avg_incr_rate = np.diff(predicted_norm_part, prepend=last_known_norm)
 
             # Bound each step's rate by min/max among neighbors
             min_rates = np.min(neighbor_incr_rates, axis=0)
             max_rates = np.max(neighbor_incr_rates, axis=0)
             bounded_incr_rate = np.clip(avg_incr_rate, min_rates, max_rates)
 
-            # Reconstruct bounded predicted_norm_part
-            bounded_predicted_norm_part = np.cumsum(bounded_incr_rate) + last_known_norm - bounded_incr_rate[0]
+            # Reconstruct bounded predicted_norm_part using the bounded incremental rates
+            bounded_predicted_norm_part = np.zeros(remaining_steps)
+            bounded_predicted_norm_part[0] = last_known_norm + bounded_incr_rate[0]
+            for i in range(1, remaining_steps):
+                bounded_predicted_norm_part[i] = bounded_predicted_norm_part[i-1] + bounded_incr_rate[i]
             predicted_norm_part = bounded_predicted_norm_part
             
-            # Verify continuity - the first predicted value should equal the last known value
-            if len(current_norm_data) > 0:
-                predicted_norm_part[0] = last_known_norm
+            # Debug: Log differences between consecutive prediction values
+            last_known_to_first = predicted_norm_part[0] - last_known_norm
+            first_to_second = predicted_norm_part[1] - predicted_norm_part[0] if len(predicted_norm_part) > 1 else 0
+            logging.info(f"Gap (last_known → first_predicted): {round(last_known_to_first)}")
+            logging.info(f"Gap (first_predicted → second_predicted): {round(first_to_second)}")
             
             normalized_target = np.concatenate([current_norm_data, predicted_norm_part])
             
