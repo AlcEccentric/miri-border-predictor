@@ -28,7 +28,7 @@ def should_skip_prediction(metadata: Dict[str, Any]) -> bool:
         logging.info(f"Event has ended at {event_end}. Current time: {current_time}. Skipping prediction.")
         return True
 
-    last_hour_start = event_end - datetime.timedelta(hours=1)
+    last_hour_start = event_end - datetime.timedelta(hours=2.5)
     if current_time >= last_hour_start:
         logging.info(f"Current time {current_time} is within last hour of event (starting at {last_hour_start}). Skipping prediction.")
         return True
