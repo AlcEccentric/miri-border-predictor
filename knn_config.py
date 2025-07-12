@@ -94,7 +94,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_k=3,
         early_stage_lookback=50,
         mid_stage_lookback=35,
-        late_stage_lookback=20,
+        late_stage_lookback=25,
         early_stage_metric=DistanceMetric.RMSE,
         mid_stage_metric=DistanceMetric.RMSE,
         late_stage_metric=DistanceMetric.FINAL_DIFF,
