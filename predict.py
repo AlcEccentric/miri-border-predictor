@@ -93,6 +93,27 @@ def build_result_dict(
             scale = (target_norm_final_value - last_known_norm) / (original_end - original_start)
             offset = last_known_norm - scale * original_start
             predicted_norm_part = scale * predicted_norm_part + offset
+
+            # --- BOUND INCREASING RATES ---
+            # Calculate per-step increasing rates for each neighbor
+            neighbor_incr_rates = []
+            for neighbor_curve in neighbor_norm_full_curves:
+                if len(neighbor_curve) == norm_event_length and len(neighbor_curve) > len(current_norm_data):
+                    neighbor_future = neighbor_curve[len(current_norm_data):]
+                    neighbor_incr_rates.append(np.diff(neighbor_future, prepend=neighbor_future[0]))
+            neighbor_incr_rates = np.array(neighbor_incr_rates)  # shape: (n_neighbors, remaining_steps)
+
+            # Calculate weighted average trajectory's increasing rates
+            avg_incr_rate = np.diff(predicted_norm_part, prepend=predicted_norm_part[0])
+
+            # Bound each step's rate by min/max among neighbors
+            min_rates = np.min(neighbor_incr_rates, axis=0)
+            max_rates = np.max(neighbor_incr_rates, axis=0)
+            bounded_incr_rate = np.clip(avg_incr_rate, min_rates, max_rates)
+
+            # Reconstruct bounded predicted_norm_part
+            bounded_predicted_norm_part = np.cumsum(bounded_incr_rate) + last_known_norm - bounded_incr_rate[0]
+            predicted_norm_part = bounded_predicted_norm_part
             
             # Verify continuity - the first predicted value should equal the last known value
             if len(current_norm_data) > 0:
