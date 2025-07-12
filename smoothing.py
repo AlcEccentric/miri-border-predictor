@@ -131,11 +131,15 @@ def smooth_scores_multi_range(df, ranges, end_transition_points=20):
                 # Fade in/out weights for overlapping regions
                 if extended_start < start:
                     fade_in_length = start - extended_start
-                    weights[:fade_in_length] = np.linspace(0, 1, fade_in_length)
+                    fade_in_length = min(fade_in_length, len(weights))
+                    if fade_in_length > 0:
+                        weights[:fade_in_length] = np.linspace(0, 1, fade_in_length)
                 
                 if extended_end > end:
                     fade_out_length = extended_end - end
-                    weights[-fade_out_length:] = np.linspace(1, 0, fade_out_length)
+                    fade_out_length = min(fade_out_length, len(weights))
+                    if fade_out_length > 0:
+                        weights[-fade_out_length:] = np.linspace(1, 0, fade_out_length)
                 
                 final_smoothed[extended_start:extended_end] += smoothed * weights
                 weights_sum[extended_start:extended_end] += weights
