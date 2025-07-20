@@ -205,17 +205,13 @@ def get_optimized_smoothing_config(event_type: float, sub_event_type: float, bor
         else:  # sub_event_type 2.0
             if border == 100:
                 return [
-                    {'start': None, 'end': 10, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5},
-                    {'start': None, 'end': 170, 'win_ratio': 1.0, 'poly': 1, 'overlap': 10},
-                    {'start': 170, 'end': 290, 'win_ratio': 0.9, 'poly': 2, 'overlap': 10},
-                    {'start': 290, 'end': None, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5}
+                    {'start': None, 'end': 270, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5},
+                    {'start': 270, 'end': None, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5}
                 ]
             else:  # border 2500
                 return [
-                    {'start': None, 'end': 10, 'win_ratio': 0.9, 'poly': 1, 'overlap': 5},
-                    {'start': None, 'end': 170, 'win_ratio': 0.8, 'poly': 2, 'overlap': 10},
-                    {'start': 170, 'end': 290, 'win_ratio': 0.8, 'poly': 2, 'overlap': 10},
-                    {'start': 290, 'end': None, 'win_ratio': 0.9, 'poly': 1, 'overlap': 5}
+                   {'start': None, 'end': 270, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5},
+                    {'start': 270, 'end': None, 'win_ratio': 1.0, 'poly': 1, 'overlap': 5}
                 ]
     
     elif event_type == 4.0:

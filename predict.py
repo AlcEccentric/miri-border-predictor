@@ -10,6 +10,7 @@ def build_result_dict(
     event_id: int,
     idol_id: int,
     border: float,
+    current_step: int,
     current_raw_data: np.ndarray,
     current_norm_data: np.ndarray,
     similar_ids: np.ndarray,
@@ -159,6 +160,7 @@ def build_result_dict(
 
     raw_target = denormalize_target_to_raw(
         normalized_target=normalized_target,
+        current_step=current_step,
         current_raw_data=current_raw_data,
         full_norm_length=norm_event_length,
         standard_event_length=standard_event_length,
@@ -275,6 +277,7 @@ def get_predictions(
                     event_id=event_id,
                     idol_id=idol_id,
                     border=border,
+                    current_step=step,
                     current_raw_data=current_raw_data,
                     current_norm_data=current_norm_data,
                     similar_ids=similar_ids,

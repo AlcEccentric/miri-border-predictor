@@ -99,7 +99,7 @@ def interpolate(
     for (event_id, _, _), event_border_data in all_data.groupby(['event_id', 'idol_id', 'border']):
         first_row = event_border_data.iloc[0]
         last_row = event_border_data.iloc[-1]
-        interpolate_until = None if event_id != current_event_id else last_row['aggregated_at']
+        interpolate_until = None if current_event_id == None or event_id != current_event_id else last_row['aggregated_at']
         expected_elapsed_mins_df = _generate_expected_elapsed_mins(
             event_border_data, expected_interval, interpolate_until=interpolate_until
         )

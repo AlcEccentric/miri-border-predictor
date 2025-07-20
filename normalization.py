@@ -1,97 +1,111 @@
 import numpy as np
 import pandas as pd
 import logging
+
 def normalize_consistently(df, full_norm_length, step, standard_event_length, full_event_length, actual_boost_start=None):
     """
-    Normalize data while preserving the last score and maintaining target boost ratio.
+    Normalize event data consistently while preserving boost timing and score scaling.
+    
+    Args:
+        df: Raw event data (sorted by time)
+        full_norm_length: Target normalized length (e.g., 300)
+        step: Current step index (length of known data to return)
+        standard_event_length: Standard event length for scaling
+        full_event_length: Actual length of this event
+        actual_boost_start: Actual boost start index in raw data
+    
+    Returns:
+        Normalized dataframe with length = step
     """
-    target_boost_ratio = 0.55 # for normal event only
-    target_boost_step = int(target_boost_ratio * full_norm_length)  # 165 for 300
-    
-    # Don't truncate - work with full data and preserve the last score
-    original_data = df.copy()
-    last_score = original_data['score'].iloc[-1]
-    
-    # Score scaling (if needed)
+    if len(df) == 0:
+        raise ValueError("Input dataframe is empty!")
+
+    # Sort and reset index
+    df = df.sort_values('aggregated_at').reset_index(drop=True)
+
+    # Step 1: Apply score scaling based on event length difference
     scale_factor = standard_event_length / full_event_length
-    if abs(scale_factor - 1.0) > 1e-10:
-        scaled_data = original_data.copy()
-        scaled_data['score'] = original_data['score'] * scale_factor
-        scaled_last_score = last_score * scale_factor
+    
+    scaled_df = df.copy()
+    scaled_df['score'] = df['score'] * scale_factor
+
+    # Step 2: Determine boost timing for normalization
+    target_boost_ratio = 0.55  # Standard boost ratio
+    target_boost_step = int(target_boost_ratio * full_norm_length)  # e.g., 165 for 300
+
+    # Step 3: Build normalization grid using full_event_length and boost timing
+    # This grid is always based on the expected full event, not the length of df
+    if actual_boost_start is not None and actual_boost_start < full_event_length:
+        raw_boost_idx = actual_boost_start
+        pre_boost_raw_range = raw_boost_idx
+        pre_boost_norm_range = target_boost_step
+        post_boost_raw_range = full_event_length - raw_boost_idx
+        post_boost_norm_range = full_norm_length - target_boost_step
+
+        def get_full_raw_index(norm_idx):
+            if norm_idx < target_boost_step:
+                if pre_boost_norm_range <= 1:
+                    return 0
+                ratio = norm_idx / (pre_boost_norm_range - 1)
+                return ratio * (pre_boost_raw_range - 1)
+            else:
+                if post_boost_norm_range <= 1:
+                    return raw_boost_idx
+                ratio = (norm_idx - target_boost_step) / (post_boost_norm_range - 1)
+                return raw_boost_idx + ratio * (post_boost_raw_range - 1)
     else:
-        scaled_data = original_data.copy()
-        scaled_last_score = last_score
-    
-    # Find boost start in the scaled data
-    boost_start_idx = None
-    if actual_boost_start is not None:
-        boost_mask = scaled_data['is_boosted'] == True
-        if boost_mask.any():
-            boost_start_idx = boost_mask.idxmax()
-    
-    # Create normalized timeline with proper interpolation
-    if boost_start_idx is not None:
-        # Split interpolation at boost boundary
-        
-        # Pre-boost section: interpolate from 0 to boost_start_idx -> 0 to target_boost_step
-        pre_boost_original_indices = np.arange(0, boost_start_idx)
-        pre_boost_normalized_indices = np.linspace(0, target_boost_step - 1, target_boost_step, dtype=int)
-        pre_boost_interp_indices = np.interp(pre_boost_normalized_indices, 
-                                            np.arange(len(pre_boost_original_indices)), 
-                                            pre_boost_original_indices)
-        
-        # Post-boost section: interpolate from boost_start_idx to end -> target_boost_step to step
-        post_boost_steps = step - target_boost_step
-        if post_boost_steps > 0:
-            post_boost_original_indices = np.arange(boost_start_idx, len(scaled_data))
-            post_boost_normalized_indices = np.linspace(0, post_boost_steps - 1, post_boost_steps, dtype=int)
-            post_boost_interp_indices = np.interp(post_boost_normalized_indices,
-                                                 np.arange(len(post_boost_original_indices)),
-                                                 post_boost_original_indices)
-            
-            # Combine both sections
-            all_interp_indices = np.concatenate([pre_boost_interp_indices, post_boost_interp_indices])
+        def get_full_raw_index(norm_idx):
+            if full_norm_length <= 1:
+                return 0
+            ratio = norm_idx / (full_norm_length - 1)
+            return ratio * (full_event_length - 1)
+
+    # Step 4: Interpolate available raw data onto the full normalization grid
+    result_rows = []
+    for norm_idx in range(step):
+        full_raw_idx = get_full_raw_index(norm_idx)
+        # Map full_raw_idx to available data
+        # If partial data, clamp to last available index
+        available_len = len(scaled_df)
+        mapped_idx = min(full_raw_idx, available_len - 1)
+        if mapped_idx == int(mapped_idx):
+            row = scaled_df.iloc[int(mapped_idx)].copy()
         else:
-            all_interp_indices = pre_boost_interp_indices[:step]
-    else:
-        # No boost - simple linear interpolation from 0 to len-1 -> 0 to step-1
-        all_interp_indices = np.linspace(0, len(scaled_data) - 1, step)
-    
-    # Ensure the last index points to the actual last row to preserve last score
-    if step >= full_norm_length:  # Full normalization
-        all_interp_indices[-1] = len(scaled_data) - 1
-    
-    # Interpolate all columns
-    sampled_data = []
-    for i, interp_idx in enumerate(all_interp_indices):
-        if interp_idx == int(interp_idx):  # Exact index
-            row = scaled_data.iloc[int(interp_idx)].copy()
-        else:  # Interpolation needed
-            lower_idx = int(np.floor(interp_idx))
-            upper_idx = min(int(np.ceil(interp_idx)), len(scaled_data) - 1)
-            weight = interp_idx - lower_idx
-            
-            # Interpolate numerical columns
-            row = scaled_data.iloc[lower_idx].copy()
-            for col in ['score']:  # Add other numerical columns as needed
-                if lower_idx != upper_idx:
-                    row[col] = (scaled_data.iloc[lower_idx][col] * (1 - weight) + 
-                               scaled_data.iloc[upper_idx][col] * weight)
-        
-        sampled_data.append(row)
-    
-    # Create result dataframe
-    result_df = pd.DataFrame(sampled_data).reset_index(drop=True)
-    
-    # Ensure the last score is exactly preserved
-    if step >= full_norm_length:
-        result_df.loc[result_df.index[-1], 'score'] = scaled_last_score
-    
-    # Set boost flags correctly
+            lower_idx = int(np.floor(mapped_idx))
+            upper_idx = min(int(np.ceil(mapped_idx)), available_len - 1)
+            if lower_idx == upper_idx:
+                row = scaled_df.iloc[lower_idx].copy()
+            else:
+                weight = mapped_idx - lower_idx
+                row = scaled_df.iloc[lower_idx].copy()
+                for col in ['score']:
+                    row[col] = (scaled_df.iloc[lower_idx][col] * (1 - weight) +
+                               scaled_df.iloc[upper_idx][col] * weight)
+        result_rows.append(row)
+
+    # Step 5: Create result dataframe
+    result_df = pd.DataFrame(result_rows).reset_index(drop=True)
+
+    # Step 6: Set correct boost flags
     result_df['is_boosted'] = False
     if target_boost_step < step:
         result_df.loc[target_boost_step:, 'is_boosted'] = True
-    
+
+    # Step 7: Preserve the value at step-1 exactly
+    if step > 0:
+        available_len = len(scaled_df)
+        last_full_raw_idx = get_full_raw_index(step - 1)
+        mapped_last_idx = min(last_full_raw_idx, available_len - 1)
+        if mapped_last_idx == int(mapped_last_idx):
+            exact_score = scaled_df.iloc[int(mapped_last_idx)]['score']
+        else:
+            lower_idx = int(np.floor(mapped_last_idx))
+            upper_idx = min(int(np.ceil(mapped_last_idx)), available_len - 1)
+            weight = mapped_last_idx - lower_idx
+            exact_score = (scaled_df.iloc[lower_idx]['score'] * (1 - weight) +
+                          scaled_df.iloc[upper_idx]['score'] * weight)
+        result_df.loc[step - 1, 'score'] = exact_score
+
     return result_df
 
 def do_normalize(df, norm_event_length, step, standard_event_length, eid_to_len_boost_ratio):
@@ -150,109 +164,85 @@ def do_normalize(df, norm_event_length, step, standard_event_length, eid_to_len_
 def denormalize_consistently(normalized_scores, full_norm_length, target_length, standard_event_length, full_event_length, actual_boost_start=None):
     """
     Revert the normalization process to get original scale scores.
-    This is the INVERSE of normalize_consistently - it expands normalized data back to raw temporal resolution.
-    
-    Args:
-        normalized_scores: normalized score array (length = full_norm_length)
-        full_norm_length: target normalized length (300)
-        target_length: desired output length (raw event length, e.g., 397)
-        standard_event_length: standard length used in normalization
-        full_event_length: original full length (397)
-        actual_boost_start: actual boost start point in original data (e.g., 192)
-    
-    Returns:
-        denormalized scores at original scale and temporal resolution
+    This matches the logic in normalize_consistently.
     """
-    # Step 1: Check if we need score scaling
+    # Step 1: Reverse score scaling
     scale_factor = standard_event_length / full_event_length
-    apply_score_scaling = abs(scale_factor - 1.0) > 1e-10
-    
-    # Step 2: Check if we need temporal expansion
-    need_temporal_expansion = target_length != len(normalized_scores)
-    
-    # Fast path: if no scaling or expansion is needed, return as-is
-    if not apply_score_scaling and not need_temporal_expansion:
-        logging.debug(f"No denormalization needed - returning normalized scores unchanged")
-        logging.debug(f"Normalized final value: {normalized_scores[-1]}")
-        return normalized_scores.copy()
-    
-    # Step 2: Expand temporal resolution using clean approach
-    if need_temporal_expansion:
-        # Get the normalized future part (entire curve)
-        norm_future_part = normalized_scores.copy()
-        
-        # Get first and last values
-        first_value = norm_future_part[0]
-        last_value = norm_future_part[-1]
-        
-        # Make it relative by subtracting the first value
-        relative_curve = norm_future_part - first_value
-        
-        # Create extended timeline with target length
-        extended_curve = np.zeros(target_length)
-        
-        # Interpolate the relative curve to target length
-        if len(relative_curve) > 1:
-            norm_indices = np.linspace(0, len(relative_curve) - 1, target_length)
-            extended_relative = np.interp(norm_indices, np.arange(len(relative_curve)), relative_curve)
-        else:
-            extended_relative = np.zeros(target_length)
-        
-        # Add back the first value to get the final smooth curve
-        extended_curve = extended_relative + first_value
-        
-        # Ensure both ends are preserved exactly
-        extended_curve[0] = first_value
-        extended_curve[-1] = last_value
-        
-        expanded_scores = extended_curve
-        logging.debug(f"Temporal expansion: preserved first={first_value}, last={last_value}")
-    else:
-        expanded_scores = normalized_scores.copy()
-    
-    # Step 3: Revert the score scaling (inverse of: scaled_score = original_score * scale_factor)
-    if apply_score_scaling:
-        denormalized_scores = expanded_scores / scale_factor
-        logging.debug(f"Applied score scaling with factor: {scale_factor}")
-    else:
-        denormalized_scores = expanded_scores
-        logging.debug(f"No score scaling applied (scale_factor = {scale_factor})")
-    
-    # Debug logging
-    logging.debug(f"Denormalization summary:")
-    logging.debug(f"  Input length: {len(normalized_scores)}, Output length: {len(denormalized_scores)}")
-    logging.debug(f"  Normalized final value: {normalized_scores[-1]}")
-    logging.debug(f"  Expanded final value: {expanded_scores[-1]}")
-    logging.debug(f"  Denormalized final value: {denormalized_scores[-1]}")
-    
-    # For verification: check if the denormalized final value matches the normalized final value
-    # when no score scaling is applied
-    if not apply_score_scaling:
-        if abs(denormalized_scores[-1] - normalized_scores[-1]) > 1e-10:
-            logging.error(f"CRITICAL: Final value mismatch (no scaling case): normalized={normalized_scores[-1]}, denormalized={denormalized_scores[-1]}, diff={abs(denormalized_scores[-1] - normalized_scores[-1])}")
-        else:
-            logging.debug(f"✓ Final values match (no scaling case): {denormalized_scores[-1]}")
-    
-    return denormalized_scores
+    scores = normalized_scores / scale_factor
+    logging.debug(f"Denormalized final score: {scores[-1]}, scale factor: {scale_factor}")
 
-def denormalize_target_to_raw(normalized_target, current_raw_data, full_norm_length, standard_event_length, full_event_length, actual_boost_start=None):
+    # Step 2: Build mapping from normalized index to raw index (same as in normalization)
+    target_boost_ratio = 0.55
+    target_boost_step = int(target_boost_ratio * full_norm_length)
+
+    if actual_boost_start is not None and actual_boost_start < full_event_length:
+        raw_boost_idx = actual_boost_start
+        pre_boost_raw_range = raw_boost_idx
+        pre_boost_norm_range = target_boost_step
+        post_boost_raw_range = full_event_length - raw_boost_idx
+        post_boost_norm_range = full_norm_length - target_boost_step
+
+        def get_norm_index(raw_idx): # type: ignore
+            if raw_idx < raw_boost_idx:
+                if pre_boost_raw_range <= 1:
+                    return 0
+                ratio = raw_idx / (pre_boost_raw_range - 1)
+                return ratio * (pre_boost_norm_range - 1)
+            else:
+                if post_boost_raw_range <= 1:
+                    return target_boost_step
+                ratio = (raw_idx - raw_boost_idx) / (post_boost_raw_range - 1)
+                return target_boost_step + ratio * (post_boost_norm_range - 1)
+    else:
+        def get_norm_index(raw_idx):
+            if full_event_length <= 1:
+                return 0
+            ratio = raw_idx / (full_event_length - 1)
+            return ratio * (full_norm_length - 1)
+
+    # Step 3: Interpolate normalized scores onto the raw timeline
+    denorm_scores = []
+    for raw_idx in range(target_length):
+        norm_idx = get_norm_index(raw_idx)
+        if norm_idx == int(norm_idx):
+            score = scores[int(norm_idx)]
+        else:
+            lower_idx = int(np.floor(norm_idx))
+            upper_idx = min(int(np.ceil(norm_idx)), len(scores) - 1)
+            if lower_idx == upper_idx:
+                score = scores[lower_idx]
+            else:
+                weight = norm_idx - lower_idx
+                score = scores[lower_idx] * (1 - weight) + scores[upper_idx] * weight
+        denorm_scores.append(score)
+    denorm_scores = np.array(denorm_scores)
+
+    # Ensure first and last values match exactly
+    if len(denorm_scores) > 0:
+        denorm_scores[0] = scores[0]
+        denorm_scores[-1] = scores[-1]
+
+    return denorm_scores
+
+def denormalize_target_to_raw(normalized_target, current_step, current_raw_data, full_norm_length, standard_event_length, full_event_length, actual_boost_start=None):
     """
     Denormalize the full normalized target and replace the known part with actual raw data.
     Ensures continuity at the transition point.
     """
+    logging.info("Last value of normalized target: {}".format(normalized_target[-1]))
     denormalized_scores = denormalize_consistently(
-        normalized_target, 
-        full_norm_length, 
-        full_event_length, 
-        standard_event_length, 
-        full_event_length, 
-        actual_boost_start
+        normalized_scores=normalized_target, 
+        full_norm_length=full_norm_length, 
+        target_length=full_event_length, 
+        standard_event_length=standard_event_length, 
+        full_event_length=full_event_length, 
+        actual_boost_start=actual_boost_start,
     )
-    
+    logging.info(f"Denormalized target last value: {denormalized_scores[-1]}")
     # If we have known raw data, replace the beginning with actual values
     # while ensuring continuity at the transition point
     if len(current_raw_data) > 0:
-        known_length = min(len(current_raw_data), len(denormalized_scores))
+        known_length = int(min(min(len(current_raw_data), len(denormalized_scores)), len(denormalized_scores) * current_step/full_norm_length))
         result = denormalized_scores.copy()
         
         # Replace known part with actual raw data
@@ -294,24 +284,6 @@ def denormalize_target_to_raw(normalized_target, current_raw_data, full_norm_len
             else:
                 # Single point case
                 result[known_length] = last_known
-        
-        logging.debug(f"Raw denormalization summary:")
-        logging.debug(f"  Known data length: {len(current_raw_data)}")
-        logging.debug(f"  Full denormalized length: {len(denormalized_scores)}")
-        logging.debug(f"  Result length: {len(result)}")
-        if len(current_raw_data) > 0:
-            logging.debug(f"  Last known raw value: {current_raw_data[-1]}")
-        if len(result) > len(current_raw_data):
-            logging.debug(f"  First predicted raw value: {result[len(current_raw_data)]}")
-            logging.debug(f"  Final raw value: {result[-1]}")
-            
-            # Check for continuity
-            if len(current_raw_data) > 0:
-                gap = result[len(current_raw_data)] - current_raw_data[-1]
-                if abs(gap) > 1e-10:
-                    logging.error(f"CRITICAL: Gap in raw data at slice point: {gap}")
-                else:
-                    logging.debug(f"✓ No gap in raw data at slice point")
         
         return result
     else:
