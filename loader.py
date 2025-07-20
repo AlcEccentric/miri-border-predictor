@@ -23,6 +23,38 @@ def get_event_name_mapping_from_r2(r2_client: R2Client) -> Dict[int, str]:
     except Exception as e:
         logging.error(f"Error creating event name mapping: {e}", exc_info=True)
         return {}
+def save_predictions_to_local_debug(
+    r2_client: Any,  # keep signature same as upload_predictions_to_r2, but not used
+    results: Dict,
+    event_id: int,
+    debug_dir: str = "debug"
+) -> None:
+    """
+    Save prediction results to local debug folder.
+    Each idol/border prediction is saved as a JSON file under debug/{idol_id}/{border}/predictions.json.
+    """
+    import os
+    import json
+
+    # Get event name mapping (optional, for logging)
+    event_name = str(event_id)
+
+    uploaded_count = 0
+    for idol_id, borders_data in results.items():
+        for border, result_dict in borders_data.items():
+            json_data = json.dumps(result_dict, indent=2)
+            out_dir = os.path.join(debug_dir, str(idol_id), str(border))
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "predictions.json")
+            try:
+                with open(out_path, "w") as f:
+                    f.write(json_data)
+                uploaded_count += 1
+                logging.info(f"Saved prediction for idol {idol_id}, border {border} to {out_path}")
+            except Exception as e:
+                logging.error(f"Error saving prediction for idol {idol_id}, border {border}: {e}", exc_info=True)
+
+    logging.info(f"Successfully saved {uploaded_count} prediction files to local debug folder for event: {event_name}")
 
 def upload_predictions_to_r2(
     r2_client: R2Client,
@@ -58,20 +90,15 @@ def upload_predictions_to_r2(
 def _process_border_and_event_data(
     border_info: pd.DataFrame,
     event_info: pd.DataFrame,
+    event_type: int,
+    exclude_event_ids: List[int],
     event_id_range: Tuple[int, int] = (0, 1000),
-    max_look_back_year: int = 100,
-    exclude_event_types: Optional[List[int]] = None,
-    exclude_event_ids: Optional[List[int]] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if exclude_event_types is None:
-        exclude_event_types = [10, 12]
-    
-    if exclude_event_ids is None:
-        exclude_event_ids = [48, 58, 68, 72, 137, 220, 170, 296, 331]
 
     border_info['aggregated_at'] = pd.to_datetime(border_info['aggregated_at'])
+    mask = event_info['boost_at'] == '0001-01-01T00:00:00Z'
+    event_info.loc[mask, 'boost_at'] = event_info.loc[mask, 'end_at']
     event_info['start_at'] = pd.to_datetime(event_info['start_at'])
-    event_info['start_date'] = pd.to_datetime(event_info['start_at']).dt.date
     event_info['end_at'] = pd.to_datetime(event_info['end_at']) + pd.Timedelta(seconds=1)
     event_info['boost_at'] = pd.to_datetime(event_info['boost_at'])
 
@@ -82,20 +109,21 @@ def _process_border_and_event_data(
     new_rows['aggregated_at'] = new_rows['aggregated_at'].dt.normalize() + pd.Timedelta(hours=15)
     border_info = pd.concat([border_info, new_rows], ignore_index=True)
     border_info = border_info.sort_values(['event_id', 'border', 'aggregated_at'])
-    
-    # Filter event_info
-    earliest_start_at = pd.Timestamp.now(tz='Asia/Tokyo') - pd.DateOffset(years=max_look_back_year)
-    event_info = event_info[(event_info['event_id'] >= event_id_range[0]) & 
-                            (event_info['event_id'] <= event_id_range[1]) &
-                            ~event_info['event_id'].isin(exclude_event_ids) &
-                            ~event_info['event_type'].isin(exclude_event_types) &
-                            (event_info['start_at'] >= earliest_start_at)]
+
+    # Filter by event_id range
+    event_info = event_info[(event_info['event_id'] >= event_id_range[0]) & (event_info['event_id'] <= event_id_range[1])]
+    logging.debug("After event_id range filter:", event_info.shape)
+
+    # Filter by exclude_event_ids
+    event_info = event_info[~event_info['event_id'].isin(exclude_event_ids)]
+    logging.debug("After exclude_event_ids filter:", event_info.shape)
+
+    # Filter by event_type
+    event_info = event_info[event_info['event_type'] == event_type]
+    logging.debug("After event_type filter:", event_info.shape)
 
     # Adjust aggregated_at values
     merged = border_info.merge(event_info[['event_id', 'end_at']], on='event_id', how='inner')
-    too_late = merged['aggregated_at'] > merged['end_at']
-    if too_late.any():
-        merged.loc[too_late, 'aggregated_at'] = merged.loc[too_late, 'end_at']
 
     # Check for duplicates
     for (_, _), border_info_per_event_border in merged.groupby(['event_id', 'border']):
@@ -185,15 +213,24 @@ def _process_anniversary_data(
 def load_data_from_r2(
     r2_client: R2Client,
     current_event_id: int,
+    event_type: int,
     borders: List[int] = [100, 2500],
-    max_look_back_year: int = 4
+    use_local_cache=False,
+    local_cache_dir: str = './data_cache',
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    border_info_cache_path = os.path.join(local_cache_dir, 'normal_border_info.pkl')
+    event_info_cache_path = os.path.join(local_cache_dir, 'normal_event_info.pkl')
+    if use_local_cache and os.path.exists(border_info_cache_path) and os.path.exists(event_info_cache_path):
+        try:
+            logging.info("Loading normal data from local cache...")
+            border_info = pd.read_pickle(border_info_cache_path)
+            event_info = pd.read_pickle(event_info_cache_path)
+            logging.info(f"Successfully loaded {len(border_info)} border records and {len(event_info)} event records from cache")
+            return border_info, event_info
+        except Exception as e:
+            logging.warning(f"Failed to load from cache, falling back to R2: {e}", exc_info=True)
     event_file_key = 'event_info/event_info_all.csv'
-    event_id_range = (1, current_event_id)
-    exclude_event_types = [
-        10, # ツインステージ
-        12, # ツインステージ   
-    ]
+    event_id_range = (100, current_event_id)
 
     # Outliers which are not representative of typical behavior
     exclude_event_ids = [
@@ -219,31 +256,34 @@ def load_data_from_r2(
     
     for event_id in range(1, current_event_id + 1):
         for border in borders:
-            filename = f'border_info_{event_id}_0_{border}.csv'
+            filename = f'border_info_{event_id}_0_{int(border)}.csv'
             file_key = f'border_info/{filename}'
-            
+    
             try:
                 obj = r2_client.get_object(BUCKET_NAME, file_key)
                 df = pd.read_csv(StringIO(obj['Body'].read().decode('utf-8')))
-                df['event_id'] = event_id
-                df['border'] = border
                 border_dfs.append(df)
             except r2_client.client.exceptions.NoSuchKey:
                 continue
             except Exception as e:
                 logging.warning(f"Could not load {filename} from R2: {e}", exc_info=True)
     
-    if border_dfs:
-        border_info = pd.concat(border_dfs, ignore_index=True)
-        logging.info(f"Loaded {len(border_info)} border info records from R2")
-    else:
-        border_info = pd.DataFrame(columns=['event_id', 'border', 'aggregated_at', 'score'])
-        logging.warning("No border info files found in R2")
+    border_info = pd.concat(border_dfs, ignore_index=True)
+    logging.info(f"Loaded {len(border_info)} border info records from R2")
     
     merged, event_info = _process_border_and_event_data(
-        border_info, event_info, event_id_range, max_look_back_year,
-        exclude_event_types, exclude_event_ids
+        border_info, event_info, event_type, exclude_event_ids, event_id_range
     )
+
+    # Save to cache if enabled
+    if use_local_cache:
+        try:
+            os.makedirs(local_cache_dir, exist_ok=True)
+            border_info.to_pickle(border_info_cache_path)
+            event_info.to_pickle(event_info_cache_path)
+            logging.info(f"Saved anniversary data to local cache at {local_cache_dir}")
+        except Exception as e:
+            logging.warning(f"Failed to save to cache: {e}", exc_info=True)
     
     logging.info(f"Loaded {len(event_info)} events from R2")
     return merged, event_info
@@ -364,15 +404,20 @@ def load_latest_event_metadata_from_r2(r2_client: R2Client) -> Dict[str, Any]:
         logging.error(f"Error loading metadata from R2: {e}", exc_info=True)
         raise
 
-def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = False) -> Tuple[pd.DataFrame, Dict[int, str]]:
+def load_all_data(r2_client: R2Client,
+                  metadata: Any,
+                  target: str,
+                  idol_ids: List[int],
+                  use_local_cache: bool = False) -> Tuple[pd.DataFrame, Dict[Tuple[int, int], Dict[str, any]], Dict[int, str]]: # type: ignore
     logging.info("Loading data from R2...")
-
-    target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
     if target == 'normal':
-        b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'])
+        logging.info("Loading normal data from R2...")
+        b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'], metadata['EventType'], use_local_cache=use_local_cache)
     else:
+        logging.info("Loading anniversary data from R2...")
         b_info, e_info = load_anniversary_data_from_r2(r2_client, use_local_cache=use_local_cache)
 
+    eid_to_len_boost_ratio = get_len_and_boost_ratio(event_info=e_info, idol_ids=idol_ids)
     # Extract event_id to name mapping
     event_name_map = dict(zip(e_info['event_id'], e_info['name']))
     logging.info(f"Created event name mapping for {len(event_name_map)} events")
@@ -381,5 +426,29 @@ def load_all_data(r2_client: R2Client, metadata: Any, use_local_cache: bool = Fa
     df = combine_info(b_info, e_info)
     df = interpolate(df, metadata['EventId'])    
     df = process_data(df)
+    logging.debug(f"Unique event ids: {df['event_id'].unique()}")
 
-    return df, event_name_map
+    return df, eid_to_len_boost_ratio, event_name_map
+
+def get_len_and_boost_ratio(event_info: pd.DataFrame, idol_ids: List[int]) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    eid_to_len_boost_ratio = {}
+
+    for event_id in event_info['event_id'].unique():
+        edf = event_info[event_info['event_id'] == event_id]
+        if len(edf) > 0:
+            start_at = pd.to_datetime(edf.iloc[0]['start_at'])
+            end_at = pd.to_datetime(edf.iloc[0]['end_at'])
+            boost_at = pd.to_datetime(edf.iloc[0]['boost_at'])
+            # Calculate length in 30-min steps (+1 for inclusive)
+            length = int(((end_at - start_at).total_seconds() / 1800) + 1)
+            # Calculate boost ratio
+            boost_ratio = ((boost_at - start_at).total_seconds() / (end_at - start_at).total_seconds()) if (end_at > start_at) else None
+            boost_start = int(((boost_at - start_at).total_seconds() / 1800)) if (boost_at > start_at) else None
+            logging.debug(f"Event {event_id} length: {length}, boost ratio: {boost_ratio}")
+            for idol_id in idol_ids:
+                eid_to_len_boost_ratio[(event_id, idol_id)] = {
+                    'boost_ratio': boost_ratio,
+                    'length': length,
+                    'boost_start': boost_start,
+                }
+    return eid_to_len_boost_ratio

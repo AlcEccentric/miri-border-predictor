@@ -49,6 +49,16 @@ def combine_info(
         how='inner'
     )
 
+    problematic_rows = all_data[all_data['aggregated_at'] >= all_data['end_at']]
+    
+    if not problematic_rows.empty:
+        latest_problematic = problematic_rows.loc[
+            problematic_rows.groupby(['event_id', 'idol_id', 'border'])['aggregated_at'].idxmax()
+        ].copy()
+        latest_problematic['aggregated_at'] = latest_problematic['end_at']
+        all_data = all_data[all_data['aggregated_at'] < all_data['end_at']]
+        all_data = pd.concat([all_data, latest_problematic], ignore_index=True)
+
     all_data['date'] = all_data['aggregated_at'].dt.date
 
     return all_data.sort_values('aggregated_at')

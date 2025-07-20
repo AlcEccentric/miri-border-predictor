@@ -1,6 +1,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 from typing import Dict, Optional, Tuple
 
 
@@ -26,7 +27,11 @@ class GroupConfig:
     
     early_stage_lookback: int = 40
     mid_stage_lookback: int = 30
-    late_stage_lookback: int = 23    
+    late_stage_lookback: int = 23
+
+    early_stage_lookback_for_align: int = 40
+    mid_stage_lookback_for_align: int = 30
+    late_stage_lookback_for_align: int = 23    
 
     early_stage_metric: DistanceMetric = DistanceMetric.RMSE
     mid_stage_metric: DistanceMetric = DistanceMetric.RMSE
@@ -49,6 +54,7 @@ class GroupConfig:
     })
     
     use_trend_weighting: bool = False
+    disable_scale: bool = False
     trend_weight: float = 0.3
     smoothing_window: Optional[int] = None
     outlier_threshold: float = 2.5
@@ -88,15 +94,19 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     
     configs[(3.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
-        mid_stage_end=240,
+        mid_stage_end=270,
         early_stage_k=6,
-        mid_stage_k=4,
-        late_stage_k=3,
+        mid_stage_k=5,
+        late_stage_k=5,
+        disable_scale=False,
         early_stage_lookback=50,
         mid_stage_lookback=35,
-        late_stage_lookback=25,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=60,
+        mid_stage_lookback_for_align=35,
+        late_stage_lookback_for_align=25, 
         early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
         late_stage_metric=DistanceMetric.FINAL_DIFF,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
@@ -104,14 +114,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.RATIO: 0.1
         },
         mid_stage_weights={
-            AlignmentMethod.AFFINE: 0.5,
-            AlignmentMethod.RATIO: 0.3,
-            AlignmentMethod.LINEAR: 0.2
-        },
-        late_stage_weights={
-            AlignmentMethod.RATIO: 0.6,
-            AlignmentMethod.AFFINE: 0.3,
-            AlignmentMethod.LINEAR: 0.1
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
         },
         early_stage_use_ensemble=True,
         mid_stage_use_ensemble=True,
@@ -124,6 +129,72 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_use_smooth_for_prediction=True,
         mid_stage_use_smooth_for_prediction=True,
         late_stage_use_smooth_for_prediction=True
+    )
+
+    configs[(3.0, (2.0,), 2500.0)] = GroupConfig(
+        early_stage_end=170,
+        mid_stage_end=270,
+        early_stage_k=5,
+        mid_stage_k=5,
+        late_stage_k=5,
+        disable_scale=False,
+        early_stage_lookback=50,
+        mid_stage_lookback=35,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=45,
+        mid_stage_lookback_for_align=35,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        mid_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
+        mid_stage_use_ensemble=True,
+        late_stage_use_ensemble=False,
+        
+        early_stage_use_smooth_for_neighbors=True,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        
+        early_stage_use_smooth_for_prediction=True,
+        mid_stage_use_smooth_for_prediction=True,
+        late_stage_use_smooth_for_prediction=True
+    )
+
+    configs[(4.0, (1.0, 2.0,), 100.0)] = GroupConfig(
+        early_stage_end=170,
+        mid_stage_end=240,
+        early_stage_k=6,
+        mid_stage_k=4,
+        late_stage_k=4,
+        early_stage_lookback=50,
+        mid_stage_lookback=20,
+        late_stage_lookback=10,
+        early_stage_lookback_for_align=80,
+        mid_stage_lookback_for_align=40,
+        late_stage_lookback_for_align=40, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_use_ensemble=False,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        early_stage_use_smooth_for_neighbors=False,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        
+        early_stage_use_smooth_for_prediction=False,
+        mid_stage_use_smooth_for_prediction=False,
+        late_stage_use_smooth_for_prediction=False
     )
 
     configs[(5.0, (1.0,), 100.0)] = GroupConfig(
@@ -206,5 +277,6 @@ def get_group_config(event_type: float, sub_types: Tuple[float], border: float) 
     """Get configuration for specific group"""
     key = (event_type, sub_types, border)
     if key not in GROUP_CONFIGS:
+        logging.warning(f'Group config not found for {key}')
         GROUP_CONFIGS[key] = GroupConfig()
     return GROUP_CONFIGS[key]

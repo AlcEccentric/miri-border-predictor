@@ -1,14 +1,15 @@
 import datetime
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 import pandas as pd
 from dateutil import parser
 import pytz
+import numpy as np
 
 # Import logger configuration first
 import logger_config
 
-from loader import load_all_data, load_latest_event_metadata_from_r2, upload_predictions_to_r2
+from loader import load_all_data, load_latest_event_metadata_from_r2, save_predictions_to_local_debug, upload_predictions_to_r2
 from data_processing import purge
 from predict import get_predictions
 from r2_client import R2Client
@@ -55,7 +56,7 @@ def calculate_standard_event_length(df):
     else:
         standard_event_length = int(most_frequent_item)
     
-    logging.debug(f"Standard event length (most frequent): {standard_event_length}")
+    logging.info(f"Standard event length (most frequent): {standard_event_length}")
     logging.debug(f"Length distribution: {dict(length_counts.head())}")
     
     return standard_event_length
@@ -75,17 +76,27 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
 
     # Feature engineering
     logging.info("Adding features...")
+    df['time_idx'] = (df.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount()) 
     feature_df = add_additional_features(df)
     feature_df['time_idx'] = (feature_df.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
+    
+    norm_df['time_idx'] = (norm_df.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount()) 
     norm_feature_df = add_additional_features(norm_df)
     norm_feature_df['time_idx'] = (norm_feature_df.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
+    
+    n_pdf['time_idx'] = (n_pdf.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount()) 
     nf_pdf = add_additional_features(n_pdf)
     nf_pdf['time_idx'] = (nf_pdf.sort_values('aggregated_at').groupby(['border', 'event_id', 'idol_id']).cumcount())
 
-    # debug
-    logging.debug(f"Idol 44 max score in df: {df[(df['event_id'] == metadata['EventId']) & (df['idol_id'] == 44)]['score'].max()}")
-    logging.debug(f"Idol 44 max score in pdf: {pdf[(pdf['event_id'] == metadata['EventId']) & (pdf['idol_id'] == 44)]['score'].max()}")
-    logging.debug(f"Idol 44 max score in n_pdf: {n_pdf[(n_pdf['event_id'] == metadata['EventId']) & (n_pdf['idol_id'] == 44)]['score'].max()}")
+    for (event_id, idol_id) in nf_pdf[['event_id', 'idol_id']].drop_duplicates().values:
+        part_scores = nf_pdf[(nf_pdf['event_id'] == event_id) & (nf_pdf['idol_id'] == idol_id)]['score']
+        full_scores = norm_feature_df[(norm_feature_df['event_id'] == event_id) & (norm_feature_df['idol_id'] == idol_id)]['score']
+        if len(part_scores) > 0 and len(full_scores) > current_step-1:
+            part_last = part_scores.iloc[-1]
+            full_at_step = full_scores.iloc[current_step-1]
+            if not np.isclose(part_last, full_at_step):
+                print(f"DEBUG: Mismatch for event {event_id}, idol {idol_id}, step {current_step}: part_last={part_last}, full_at_step={full_at_step}")
+                break
 
     # Smoothing
     logging.info("Generating smoothed data...")
@@ -108,7 +119,8 @@ def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any],
     logging.info("Starting predictions...")
     
     internal_event_type_to_sub_types = {
-        5.0: (1.0,)
+        5: (1.0,),
+        18: (2.0,) 
     }
 
     results = get_predictions(
@@ -129,48 +141,6 @@ def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any],
     logging.info("Predictions completed")
     return results
 
-def get_len_and_boost_ratio(df: pd.DataFrame, current_event_id: int) -> Dict[Tuple[int, int], Dict[str, Any]]:
-    eid_to_len_boost_ratio = {}
-    
-    # Get current event type info
-    current_event_data = df[df['event_id'] == current_event_id]
-    current_event_type = current_event_data['event_type'].iloc[0] if len(current_event_data) > 0 else None
-    current_internal_event_type = current_event_data['internal_event_type'].iloc[0] if len(current_event_data) > 0 else None
-    
-    # Find template event (most recent similar event with same event type and internal event type)
-    template_params = None
-    if current_event_type is not None:
-        similar_events = df[(df['event_id'] != current_event_id) & (df['event_type'] == current_event_type) & (df['internal_event_type'] == current_internal_event_type)]
-        if len(similar_events) > 0:
-            template_event_id = similar_events['event_id'].max()
-            template_idol_id = similar_events[similar_events['event_id'] == template_event_id]['idol_id'].max()
-            template_data = similar_events[(similar_events['event_id'] == template_event_id) & (similar_events['idol_id'] == template_idol_id) & (similar_events['border'] == 100.0)]
-            if len(template_data) > 0:
-                boost_start = template_data.reset_index().index[template_data['is_boosted'] == True][0] if True in template_data['is_boosted'].values else None
-                template_params = {
-                    'boost_ratio': boost_start/len(template_data) if boost_start else None,
-                    'length': len(template_data),
-                    'boost_start': boost_start,
-                }
-    
-    # Process all events
-    for event_id in df['event_id'].unique():
-        for idol_id in df['idol_id'].unique():
-            if event_id == current_event_id:
-                # Use template params for current event
-                eid_to_len_boost_ratio[(event_id, idol_id)] = template_params or {'boost_ratio': None, 'length': None, 'boost_start': None}
-            else:
-                # Calculate params for historical events
-                edf = df[(df['event_id'] == event_id) & (df['idol_id'] == idol_id) & (df['border'] == 100.0)]
-                if len(edf) > 0:
-                    boost_start = edf.reset_index().index[edf['is_boosted'] == True][0] if True in edf['is_boosted'].values else None
-                    eid_to_len_boost_ratio[(event_id, idol_id)] = {
-                        'boost_ratio': boost_start/len(edf) if boost_start else None,
-                        'length': len(edf),
-                        'boost_start': boost_start,
-                    }
-    return eid_to_len_boost_ratio
-
 def check_event_length(target, df):
     group_lengths = df.groupby(['event_id', 'idol_id', 'border']).size()
     unique_lengths = group_lengths.unique()
@@ -185,7 +155,10 @@ def check_event_length(target, df):
 
 def get_current_step(norm_event_length: int, metadata: Dict[str, Any], df: pd.DataFrame) -> int:
     """Calculate current step based on event progress"""
+    logging.debug(f"Current event id: {metadata['EventId']}")
+    logging.debug(f"Ids in data: {df['event_id'].unique()}")
     current_data = df[(df['event_id'] == metadata['EventId'])]
+    logging.debug(f"Norm event length: {norm_event_length}, current data shape: {current_data.shape}")
     
     event_start_time = parser.isoparse(metadata['StartAt'])
     event_end_time = parser.isoparse(metadata['EndAt'])
@@ -200,8 +173,20 @@ def main():
     
     r2_client = R2Client()
     metadata = load_latest_event_metadata_from_r2(r2_client=r2_client)
+    testing = False
+
+    # For testing
+    if testing:
+        metadata = {
+            'EventId': 378,
+            'EventType': metadata['EventType'],
+            'InternalEventType': metadata['InternalEventType'],
+            'EventName': metadata['EventName'],
+            'StartAt': "2025-04-18T15:00:00+09:00",
+            'EndAt': "2025-04-25T20:59:59+09:00",
+        }
     
-    if should_skip_prediction(metadata):
+    if not testing and should_skip_prediction(metadata) :
         logging.info("Prediction skipped due to timing constraints.")
         return
     
@@ -215,12 +200,17 @@ def main():
     logging.info(f"Using borders: {borders}")
 
     # Load data and calculate parameters
-    df, event_name_map = load_all_data(r2_client, metadata, use_local_cache=False)
-    
-    eid_to_len_boost_ratio = get_len_and_boost_ratio(df, metadata['EventId'])
+    df, eid_to_len_boost_ratio, event_name_map = load_all_data(r2_client,
+                                                               metadata,
+                                                               target,
+                                                               idol_ids,
+                                                               use_local_cache=True if testing else False)
     standard_event_length = calculate_standard_event_length(df)
     
     current_step = get_current_step(norm_event_length, metadata, df)
+    # For testing
+    if testing:
+        current_step = 270
     logging.info(f"Current step: {current_step}/{norm_event_length}")
 
     new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
@@ -228,7 +218,10 @@ def main():
     results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio, event_name_map)
 
     if results:
-        upload_predictions_to_r2(r2_client, results, metadata['EventId'])
+        if testing:
+            save_predictions_to_local_debug(r2_client, results, metadata['EventId'])
+        else:
+            upload_predictions_to_r2(r2_client, results, metadata['EventId'])
         logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
     else:
         logging.warning("No results to upload")
