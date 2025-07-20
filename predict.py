@@ -22,6 +22,7 @@ def build_result_dict(
     actual_boost_start: int,
     smoothed_prediction: np.ndarray,
     event_name_map: Dict,
+    eid_to_len_boost_ratio: Dict
 ) -> Dict:
     # Initialize result structure
     event_name = event_name_map[event_id]
@@ -63,7 +64,8 @@ def build_result_dict(
         result["metadata"]["normalized"]["neighbors"][str(i+1)] = {
             "id": int(neighbor_eid),
             "idol_id": int(neighbor_iid),
-            "name": neighbor_name
+            "name": neighbor_name,
+            "raw_length": eid_to_len_boost_ratio[(neighbor_eid, neighbor_iid)]['length'],
         }
         result["data"]["normalized"]["neighbors"][str(i+1)] = [round(x) for x in neighbor_norm_data.tolist()]
         neighbor_norm_full_curves.append(neighbor_norm_data)
@@ -289,6 +291,7 @@ def get_predictions(
                     actual_boost_start=eid_to_len_boost_ratio[(event_id, idol_id)]['boost_start'],
                     smoothed_prediction=smoothed_prediction,
                     event_name_map=event_name_map,
+                    eid_to_len_boost_ratio=eid_to_len_boost_ratio,
                 )
 
                 results[idol_id][border] = result
