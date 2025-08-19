@@ -201,12 +201,15 @@ def main():
     borders = [100.0, 1000.0] if target == 'anniversary' else [100.0, 2500.0]
     idol_ids = list(range(1, 53)) if target == 'anniversary' else [0]
     logging.info(f"Using borders: {borders}")
+    min_event_id = get_min_event_id(metadata['InternalEventType'])
+    logging.info(f"Using min event id: {min_event_id}")
 
     # Load data and calculate parameters
     df, eid_to_len_boost_ratio, event_name_map = load_all_data(r2_client,
                                                                metadata,
                                                                target,
                                                                idol_ids,
+                                                               min_event_id,
                                                                use_local_cache=True if testing else False)
     standard_event_length = calculate_standard_event_length(df)
     
@@ -230,6 +233,11 @@ def main():
         logging.warning("No results to upload")
 
     return results
+
+def get_min_event_id(internal_event_type: int) -> int:
+    if internal_event_type in [22, 23]: # TourBingo & TourSpecial
+        return 250
+    return 100
 
 def get_sub_event_types(event_id: int, internal_event_type: int, event_type: float) -> Tuple[float, ...]:
     """

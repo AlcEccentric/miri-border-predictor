@@ -215,6 +215,7 @@ def load_data_from_r2(
     current_event_id: int,
     event_type: int,
     borders: List[int] = [100, 2500],
+    min_event_id: int = 100,
     use_local_cache=False,
     local_cache_dir: str = './data_cache',
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -230,7 +231,7 @@ def load_data_from_r2(
         except Exception as e:
             logging.warning(f"Failed to load from cache, falling back to R2: {e}", exc_info=True)
     event_file_key = 'event_info/event_info_all.csv'
-    event_id_range = (100, current_event_id)
+    event_id_range = (min_event_id, current_event_id)
 
     # Outliers which are not representative of typical behavior
     exclude_event_ids = [
@@ -408,11 +409,12 @@ def load_all_data(r2_client: R2Client,
                   metadata: Any,
                   target: str,
                   idol_ids: List[int],
+                  min_event_id: int,
                   use_local_cache: bool = False) -> Tuple[pd.DataFrame, Dict[Tuple[int, int], Dict[str, any]], Dict[int, str]]: # type: ignore
     logging.info("Loading data from R2...")
     if target == 'normal':
         logging.info("Loading normal data from R2...")
-        b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'], metadata['EventType'], use_local_cache=use_local_cache)
+        b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'], metadata['EventType'], min_event_id=min_event_id, use_local_cache=use_local_cache)
     else:
         logging.info("Loading anniversary data from R2...")
         b_info, e_info = load_anniversary_data_from_r2(r2_client, use_local_cache=use_local_cache)
