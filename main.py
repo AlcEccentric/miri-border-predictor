@@ -117,17 +117,20 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
 def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, idol_ids: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict, event_name_map: Dict) -> Dict:
     """Run the prediction pipeline"""
     logging.info("Starting predictions...")
-    
-    internal_event_type_to_sub_types = {
-        5: (1.0,),
-        18: (2.0,) 
-    }
+
+    sub_event_types = get_sub_event_types(
+        event_id=metadata['EventId'],
+        internal_event_type=metadata['InternalEventType'],
+        event_type=metadata['EventType']
+    )
+
+    logging.info(f"Sub event types: {sub_event_types}")
 
     results = get_predictions(
         data=new_data,
         event_id=metadata['EventId'],
         event_type=metadata['EventType'],
-        sub_types=internal_event_type_to_sub_types[metadata['InternalEventType']],
+        sub_types=sub_event_types,
         idol_ids=idol_ids,
         borders=borders,
         step=current_step,
@@ -228,6 +231,45 @@ def main():
 
     return results
 
+def get_sub_event_types(event_id: int, internal_event_type: int, event_type: float) -> Tuple[float, ...]:
+    """
+    Determine sub_event_type based on event_id, internal_event_type, and event_type.
+    Returns the sub_event_type that would be assigned by the feature engineering functions.
+    """
+    if event_type == 3.0:
+        # For event type 3, check if it has bonus
+        boosted_internal_event_types = range(16, 21)  # 16 (Tiara), 17-20 (Trust...)
+        if internal_event_type in boosted_internal_event_types:
+            return (2.0,)  # has_bonus = True
+        else:
+            return (1.0,)  # has_bonus = False
+    
+    elif event_type == 4.0:
+        # For event type 4, check bonus conditions
+        has_bonus = (
+            (internal_event_type == 22) or
+            ((internal_event_type == 23) and (event_id > 300))
+        )
+        if has_bonus:
+            return (2.0,)
+        else:
+            return (1.0,)
+    
+    elif event_type == 11.0:
+        # For event type 11, all events have sub_event_type = 1.0
+        return (1.0,)
+    
+    elif event_type == 13.0:
+        # For event type 13, all events have sub_event_type = 1.0
+        return (1.0,)
+    
+    elif event_type == 5.0:
+        # For event type 5, all events have sub_event_type = 1.0
+        return (1.0,)
+    
+    else:
+        # Default case (not explicitly handled in feature engineering)
+        return (1.0,)
 
 if __name__ == "__main__":
     main()

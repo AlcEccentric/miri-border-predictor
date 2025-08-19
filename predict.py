@@ -222,7 +222,7 @@ def get_predictions(
     data: Dict[str, pd.DataFrame],
     event_id: int,
     event_type: float,
-    sub_types: Tuple[float],
+    sub_types: Tuple[float, ...],
     idol_ids: List[int],
     borders: List[float],
     step: int,
