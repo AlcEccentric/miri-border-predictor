@@ -59,6 +59,11 @@ class GroupConfig:
     smoothing_window: Optional[int] = None
     outlier_threshold: float = 2.5
 
+
+    early_stage_scale_cap: Tuple[float, float] = (0.5, 2)
+    mid_stage_scale_cap: Tuple[float, float] = (0.5, 2)
+    late_stage_scale_cap: Tuple[float, float] = (0.5, 2)
+
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
     late_stage_use_ensemble: bool = False
@@ -170,12 +175,16 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_use_smooth_for_prediction=True
     )
 
-    configs[(4.0, (1.0, 2.0,), 100.0)] = GroupConfig(
+    configs[(4.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
-        mid_stage_end=240,
-        early_stage_k=6,
-        mid_stage_k=4,
-        late_stage_k=4,
+        mid_stage_end=260,
+        early_stage_k=3,
+        mid_stage_k=3,
+        late_stage_k=3,
+        disable_scale=False,
+        early_stage_scale_cap=(0.5, 2),
+        mid_stage_scale_cap=(0.5, 2),
+        late_stage_scale_cap=(0.9, 1.1),
         early_stage_lookback=50,
         mid_stage_lookback=20,
         late_stage_lookback=10,
@@ -191,7 +200,36 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_use_smooth_for_neighbors=False,
         mid_stage_use_smooth_for_neighbors=False,
         late_stage_use_smooth_for_neighbors=False,
-        
+        early_stage_use_smooth_for_prediction=False,
+        mid_stage_use_smooth_for_prediction=False,
+        late_stage_use_smooth_for_prediction=False
+    )
+
+    configs[(4.0, (2.0,), 2500.0)] = GroupConfig(
+        early_stage_end=170,
+        mid_stage_end=270, # not included
+        early_stage_k=3,
+        mid_stage_k=3,
+        late_stage_k=3,
+        disable_scale=False,
+        early_stage_scale_cap=(0.5, 2),
+        mid_stage_scale_cap=(0.9, 1.1),
+        late_stage_scale_cap=(0.9, 1.1),
+        early_stage_lookback=50,
+        mid_stage_lookback=24,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=96,
+        mid_stage_lookback_for_align=48,
+        late_stage_lookback_for_align=24, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_use_ensemble=False,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        early_stage_use_smooth_for_neighbors=False,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
         early_stage_use_smooth_for_prediction=False,
         mid_stage_use_smooth_for_prediction=False,
         late_stage_use_smooth_for_prediction=False

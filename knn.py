@@ -23,6 +23,7 @@ def align_curve(neighbor: np.ndarray,
                 start_idx: int, 
                 end_idx: int, 
                 method: AlignmentMethod,
+                scale_cap: Tuple[float, float],
                 current_step: int) -> Tuple[float, float]:
     neighbor_partial = neighbor[start_idx:end_idx]
     real_partial = real_partial_data[start_idx:end_idx]
@@ -41,7 +42,13 @@ def align_curve(neighbor: np.ndarray,
     else:  # RATIO
         real_mean = np.mean(real_partial)
         neighbor_mean = np.mean(neighbor_partial)
-        scale = real_mean / neighbor_mean if current_step < 250 else (real_partial[-1] - real_partial[0]) / (neighbor_partial[-1] - neighbor_partial[0])
+        scale = real_mean / neighbor_mean
+        if scale > scale_cap[1]:
+            logging.debug(f"Scale {scale} hit upper bound: {scale_cap[1]}")
+            scale = scale_cap[1]
+        if scale < scale_cap[0]:
+            logging.debug(f"Scale {scale} hit lower bound: {scale_cap[0]}")
+            scale = scale_cap[0]
         offset = real_partial[-1] - scale * neighbor_partial[-1]
 
     return (float(scale), float(offset))
@@ -179,17 +186,11 @@ def cap_aligned_future_increase(aligned_curve: np.ndarray,
     """
     offset = aligned_curve[current_step]
     future = aligned_curve[current_step+1:] - offset
-    aligned_future_increase = future[-1] if len(future) > 0 else 0.0
     neighbor_lookback_increase = neighbor_partial[align_end-1] - neighbor_partial[align_start]
     # Avoid division by zero
     if neighbor_lookback_increase == 0 or len(future) == 0:
         return aligned_curve
-    ratio = aligned_future_increase / neighbor_lookback_increase
-    if ratio < cap_min or ratio > cap_max:
-        logging.debug(f"Cap Hit! Ratio: {ratio}, Cap min: {cap_min}, Cap max: {cap_max}")
-        capped_increase = neighbor_lookback_increase * (cap_min if ratio < cap_min else cap_max)
-        capped_future = np.linspace(0, capped_increase, len(future))
-        future = capped_future
+
     new_curve = np.concatenate([aligned_curve[:current_step+1], future + offset])
     return new_curve
 
@@ -227,6 +228,7 @@ def ensemble_prediction(real_data: np.ndarray,
                        distances: np.ndarray,
                        lookback_window: int,
                        method_weights: Dict[AlignmentMethod, float],
+                       scale_cap: Tuple[float, float],
                        disable_scale: bool) -> np.ndarray:
     """Enhanced ensemble prediction with stage-specific weights"""
     
@@ -258,7 +260,7 @@ def ensemble_prediction(real_data: np.ndarray,
             cap_min = cap_min * (1 - tolerence)
             cap_max = cap_max * (1 + tolerence)
 
-            scale, offset = align_curve(similar_partial_curve, real_data, align_start, align_end, method, current_step)
+            scale, offset = align_curve(similar_partial_curve, real_data, align_start, align_end, method, scale_cap, current_step)
             # print(f"Method {method.value} Scale: {scale}, Offset: {offset}, Neighbor Last: {similar_partial_curve[align_end -1]}, Real Last: {real_data[align_end-1]}")
             if disable_scale:
                 scale = 1 if current_step >= 270 else scale
@@ -291,6 +293,7 @@ def get_prediction(real_data: np.ndarray,
                   distances: np.ndarray,
                   alignment_method: AlignmentMethod,
                   lookback_window: int,
+                  scale_cap: Tuple[float, float],
                   disable_scale: bool) -> np.ndarray:
     
     if lookback_window is None:
@@ -322,6 +325,7 @@ def get_prediction(real_data: np.ndarray,
                                   align_start, 
                                   align_end, 
                                   alignment_method,
+                                  scale_cap,
                                   current_step)
         
         if disable_scale:
@@ -339,14 +343,13 @@ def get_prediction(real_data: np.ndarray,
         # aligned_curve = cap_aligned_future_increase(
         #     aligned_curve, similar_partial_curve, current_step, align_start, align_end, cap_min, cap_max
         # )
-        logging.debug(f"Scale: {scale}, Offset: {offset}, Neighbor Current: {curve[current_step]}, Neighbor Last: {curve[-1]}, Diff: {curve[current_step] - curve[-1]}")
-        logging.debug(f"Before cap, first value of aligned curve: {aligned_curve[current_step]}, last value of aligned curve: {aligned_curve[-1]}")
+        logging.debug(f"Scale: {scale}, Offset: {offset}, Neighbor Current: {curve[current_step]}, Neighbor Last: {curve[-1]}, Diff: {curve[-1] - curve[current_step]}")
         # aligned_curve = cap_future_by_rate(aligned_curve, current_step, rate_min, rate_max)
         
         aligned_curve = cap_aligned_future_increase(
             aligned_curve, similar_partial_curve, current_step, align_start, align_end, cap_min, cap_max
         )
-        logging.debug(f"After cap, first value of aligned curve: {aligned_curve[current_step]}, last value of aligned curve: {aligned_curve[-1]}")
+        logging.debug(f"Scaled Neighbor Current: {aligned_curve[current_step]}, Scaled Neighbor Last: {aligned_curve[-1]}, Diff: {aligned_curve[-1] - aligned_curve[current_step]}")
         aligned_curves.append(aligned_curve)
         logging.debug(f"Weight: {weights[ci]} Distance: {processed_distances[ci]}")
     
@@ -390,6 +393,7 @@ def predict_curve_knn(event_id: float,
         method_weights = config.early_stage_weights
         use_smooth_for_neighbors = config.early_stage_use_smooth_for_neighbors
         use_smooth_for_prediction = config.early_stage_use_smooth_for_prediction
+        scale_cap = config.early_stage_scale_cap
     elif current_step < config.mid_stage_end:
         adapted_k = config.mid_stage_k
         adapted_lookback = config.mid_stage_lookback
@@ -399,6 +403,7 @@ def predict_curve_knn(event_id: float,
         method_weights = config.mid_stage_weights
         use_smooth_for_neighbors = config.mid_stage_use_smooth_for_neighbors
         use_smooth_for_prediction = config.mid_stage_use_smooth_for_prediction
+        scale_cap = config.mid_stage_scale_cap
     else:
         adapted_k = config.late_stage_k
         adapted_lookback = config.late_stage_lookback
@@ -408,7 +413,8 @@ def predict_curve_knn(event_id: float,
         method_weights = config.late_stage_weights
         use_smooth_for_neighbors = config.late_stage_use_smooth_for_neighbors
         use_smooth_for_prediction = config.late_stage_use_smooth_for_prediction
-    
+        scale_cap = config.late_stage_scale_cap
+
     # Choose data sources based on stage configuration and availability
     if use_smooth_for_neighbors and neighbor_partial_smooth is not None:
         partial_data_for_neighbor_search = neighbor_partial_smooth
@@ -484,6 +490,7 @@ def predict_curve_knn(event_id: float,
             distances,
             adapted_lookback_for_align,
             method_weights,
+            scale_cap,
             config.disable_scale,
         )
     else:
@@ -497,6 +504,7 @@ def predict_curve_knn(event_id: float,
             distances,
             AlignmentMethod.RATIO,
             adapted_lookback_for_align,
+            scale_cap,
             config.disable_scale,
         )
     
@@ -678,10 +686,6 @@ def plot_neighbors_full_and_prediction(current_partial_data: np.ndarray,
     rel_error = None
     if neighbor_prediction is not None and len(neighbor_prediction) > 0 and real_final_value is not None and real_final_value != 0:
         rel_error = abs(neighbor_prediction[-1] - real_final_value) / real_final_value * 100
-
-    # Only output if relative error > 10%
-    if rel_error is not None and rel_error <= 2:
-        return
     
     # Suppress matplotlib debug logs
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
