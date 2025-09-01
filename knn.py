@@ -440,7 +440,7 @@ def predict_curve_knn(event_id: float,
     historical_ids = []
     
     for (eid, iid), group in historical_partial_data.groupby(['event_id', 'idol_id']):
-        if len(group['score'].values) >= current_step:
+        if len(group['score'].values) >= current_step and eid >= config.least_neighbor_id:
             historical_partial_trajectories.append(group['score'].values)
             historical_ids.append((eid, iid))
     

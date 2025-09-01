@@ -237,7 +237,7 @@ def main():
 def get_min_event_id(internal_event_type: int) -> int:
     if internal_event_type in [22, 23]: # TourBingo & TourSpecial
         return 250
-    return 100
+    return 200
 
 def get_sub_event_types(event_id: int, internal_event_type: int, event_type: float) -> Tuple[float, ...]:
     """

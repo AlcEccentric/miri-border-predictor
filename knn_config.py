@@ -78,23 +78,86 @@ class GroupConfig:
 
     use_error_bounds: bool = False
     error_bound_std_multiplier: float = 2.0
+    least_neighbor_id: float = 100.0
 
 def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], GroupConfig]:
     """Get default configurations for all groups"""
     configs = {}
 
     configs[(3.0, (1.0,), 100.0)] = GroupConfig(
-        early_stage_end=150,
-        mid_stage_end=230,
+        early_stage_end=170,
+        mid_stage_end=270,
         early_stage_k=5,
-        mid_stage_k=4,
+        mid_stage_k=3,
         late_stage_k=3,
+        disable_scale=False,
+        early_stage_scale_cap=(0.9, 1.1),
+        mid_stage_scale_cap=(0.8, 1.3),
+        late_stage_scale_cap=(0.9, 1.1),
+        early_stage_lookback=5,
+        mid_stage_lookback=5,
+        late_stage_lookback=5,
+        early_stage_lookback_for_align=100,
+        mid_stage_lookback_for_align=100,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        
+        early_stage_use_smooth_for_neighbors=False,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        
+        early_stage_use_smooth_for_prediction=False,
+        mid_stage_use_smooth_for_prediction=False,
+        late_stage_use_smooth_for_prediction=False,
+        least_neighbor_id=200,
+    )
+
+    configs[(3.0, (1.0,), 2500.0)] = GroupConfig(
+        early_stage_end=170,
+        mid_stage_end=270,
+        early_stage_k=4,
+        mid_stage_k=4,
+        late_stage_k=4,
+        disable_scale=False,
+        early_stage_scale_cap=(0.99, 1.01),
+        mid_stage_scale_cap=(0.8, 1.2),
+        late_stage_scale_cap=(0.8, 1.2),
+        early_stage_lookback=50,
+        mid_stage_lookback=24,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=45,
+        mid_stage_lookback_for_align=24,
+        late_stage_lookback_for_align=24, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        
         early_stage_use_smooth_for_neighbors=True,
         mid_stage_use_smooth_for_neighbors=True,
-        late_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=True,
+        
         early_stage_use_smooth_for_prediction=True,
-        mid_stage_use_smooth_for_prediction=True,
-        late_stage_use_smooth_for_prediction=True
+        mid_stage_use_smooth_for_prediction=False,
+        late_stage_use_smooth_for_prediction=False,
+        least_neighbor_id=200,
     )
     
     configs[(3.0, (2.0,), 100.0)] = GroupConfig(
