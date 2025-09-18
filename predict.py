@@ -85,12 +85,20 @@ def load_confidence_intervals(event_type: float, sub_type: float, border: float,
     df = pd.read_csv(intervals_file)
     step_data = df[df['step'] == step]
     
+    # If exact step not found, find closest step within 25 steps
+    if step_data.empty:
+        available_steps = df['step'].unique()
+        closest_step = min(available_steps, key=lambda x: abs(x - step))
+        
+        if abs(closest_step - step) > 25:
+            raise ValueError(f"No confidence interval data found within 25 steps of step {step} in {intervals_file}. Closest available step: {closest_step}")
+        
+        step_data = df[df['step'] == closest_step]
+        logging.info(f"Using closest step {closest_step} for requested step {step}")
+    
     intervals_map = {}
     for _, row in step_data.iterrows():
         intervals_map[int(row['confidence_level'])] = (row['rel_error_lower_bound'], row['rel_error_upper_bound'])
-    
-    if not intervals_map:
-        raise ValueError(f"No confidence interval data found for step {step} in {intervals_file}")
     
     required_levels = {75, 90}
     missing_levels = required_levels - set(intervals_map.keys())
