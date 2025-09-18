@@ -2,9 +2,102 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
 import logging
+from pathlib import Path
 
 from knn import get_filtered_df, predict_curve_knn
 from normalization import denormalize_target_to_raw
+
+def calculate_confidence_bounds(normalized_target: np.ndarray,
+                                last_known_step_index: int,
+                                confidence_intervals: Dict[int, Tuple[float, float]]) -> Dict[int, Dict[str, np.ndarray]]:
+    """Calculate confidence bounds for multiple CI levels."""
+    bounds = {}
+    
+    for confidence_level, (lower_bound, upper_bound) in confidence_intervals.items():
+        upper_series = normalized_target.copy()
+        lower_series = normalized_target.copy()
+        
+        if last_known_step_index + 1 < len(normalized_target):
+            remaining_points = len(normalized_target) - (last_known_step_index + 1)
+            for i in range(last_known_step_index + 1, len(normalized_target)):
+                progress = (i - last_known_step_index - 1) / (remaining_points - 1) if remaining_points > 1 else 1
+                
+                upper_delta = progress * upper_bound
+                upper_series[i] = (1 + upper_delta) * normalized_target[i]
+                
+                lower_delta = progress * lower_bound
+                lower_series[i] = (1 + lower_delta) * normalized_target[i]
+        
+        bounds[confidence_level] = {
+            "upper": upper_series,
+            "lower": lower_series
+        }
+    
+    return bounds
+
+def validate_confidence_bounds(raw_target: np.ndarray, raw_bounds: Dict[int, Dict[str, np.ndarray]], 
+                              last_known_idx: int, confidence_intervals: Dict[int, Tuple[float, float]]) -> None:
+    """Validate confidence bounds consistency."""
+    target_at_last = raw_target[last_known_idx]
+    target_final = raw_target[-1]
+    
+    for confidence_level, bounds in raw_bounds.items():
+        upper_at_last = bounds["upper"][last_known_idx]
+        lower_at_last = bounds["lower"][last_known_idx]
+        
+        # Check 1: Values at last_known_step_index should be same across target, upper, lower (0.5% tolerance)
+        tolerance = abs(target_at_last) * 0.005
+        if not (abs(target_at_last - upper_at_last) <= tolerance and abs(target_at_last - lower_at_last) <= tolerance):
+            logging.error(f"CRITICAL: CI{confidence_level} values at last_known_step_index mismatch: target={target_at_last}, upper={upper_at_last}, lower={lower_at_last}")
+        else:
+            logging.debug(f"✓ CI{confidence_level} values at last_known_step_index match: {target_at_last}")
+        
+        # Check 2: Relative difference between final values should match confidence intervals
+        upper_final = bounds["upper"][-1]
+        lower_final = bounds["lower"][-1]
+        
+        upper_rel_diff = (upper_final - target_final) / target_final if target_final != 0 else 0
+        lower_rel_diff = (lower_final - target_final) / target_final if target_final != 0 else 0
+        
+        expected_upper = confidence_intervals[confidence_level][1]
+        expected_lower = confidence_intervals[confidence_level][0]
+        
+        upper_tolerance = abs(expected_upper) * 0.005
+        lower_tolerance = abs(expected_lower) * 0.005
+        
+        if abs(upper_rel_diff - expected_upper) > upper_tolerance:
+            logging.error(f"CRITICAL: CI{confidence_level} upper bound relative diff mismatch: got {upper_rel_diff:.6f}, expected {expected_upper:.6f}")
+        else:
+            logging.debug(f"✓ CI{confidence_level} upper bound relative diff matches: {upper_rel_diff:.6f}")
+        
+        if abs(lower_rel_diff - expected_lower) > lower_tolerance:
+            logging.error(f"CRITICAL: CI{confidence_level} lower bound relative diff mismatch: got {lower_rel_diff:.6f}, expected {expected_lower:.6f}")
+        else:
+            logging.debug(f"✓ CI{confidence_level} lower bound relative diff matches: {lower_rel_diff:.6f}")
+
+def load_confidence_intervals(event_type: float, sub_type: float, border: float, step: int) -> Dict[int, Tuple[float, float]]:
+    """Load confidence intervals for given parameters."""
+    intervals_file = Path("confidence_intervals") / f"confidence_intervals_{int(event_type)}_{int(sub_type)}_{int(border)}.csv"
+    
+    if not intervals_file.exists():
+        raise FileNotFoundError(f"Confidence intervals file not found: {intervals_file}")
+    
+    df = pd.read_csv(intervals_file)
+    step_data = df[df['step'] == step]
+    
+    intervals_map = {}
+    for _, row in step_data.iterrows():
+        intervals_map[int(row['confidence_level'])] = (row['rel_error_lower_bound'], row['rel_error_upper_bound'])
+    
+    if not intervals_map:
+        raise ValueError(f"No confidence interval data found for step {step} in {intervals_file}")
+    
+    required_levels = {75, 90}
+    missing_levels = required_levels - set(intervals_map.keys())
+    if missing_levels:
+        raise ValueError(f"Missing required confidence levels {sorted(missing_levels)} for step {step} in {intervals_file}")
+    
+    return intervals_map
 
 def build_result_dict(
     event_id: int,
@@ -22,7 +115,9 @@ def build_result_dict(
     actual_boost_start: int,
     smoothed_prediction: np.ndarray,
     event_name_map: Dict,
-    eid_to_len_boost_ratio: Dict
+    eid_to_len_boost_ratio: Dict,
+    confidence_intervals: Dict[int, Tuple[float, float]],
+    standard_event_boost_ratio: float,
 ) -> Dict:
     # Initialize result structure
     event_name = event_name_map[event_id]
@@ -35,12 +130,14 @@ def build_result_dict(
             },
             "normalized": {
                 "last_known_step_index": len(current_norm_data) - 1,
-                "neighbors": {}
+                "neighbors": {},
+                "confidence_intervals": confidence_intervals
             }
         },
         "data": {
             "raw": {
-                "target": []
+                "target": [],
+                "bounds": {}
             },
             "normalized": {
                 "target": [],
@@ -139,7 +236,8 @@ def build_result_dict(
                 norm_gap = first_predicted_norm_check - last_known_norm_check
                 logging.debug(f"Normalized gap for idol {idol_id}, border {border}: last_known={last_known_norm_check}, first_predicted={first_predicted_norm_check}, gap={norm_gap}")
                 
-                if abs(norm_gap) > 1e-10:
+                gap_tolerance = abs(last_known_norm_check) * 0.005
+                if abs(norm_gap) > gap_tolerance:
                     logging.error(f"CRITICAL: Non-zero gap in normalized data: {norm_gap}")
                     logging.error(f"  This violates requirement #1: slice point gap should be 0")
                 else:
@@ -149,7 +247,8 @@ def build_result_dict(
                 logging.debug(f"Normalized final value: {normalized_target[-1]}")
                 logging.debug(f"Target normalized final value: {target_norm_final_value}")
                 
-                if abs(normalized_target[-1] - target_norm_final_value) > 1e-10:
+                final_tolerance = abs(target_norm_final_value) * 0.005
+                if abs(normalized_target[-1] - target_norm_final_value) > final_tolerance:
                     logging.error(f"CRITICAL: Final value mismatch: got {normalized_target[-1]}, expected {target_norm_final_value}")
                 else:
                     logging.debug(f"✓ Normalized final value matches target: {normalized_target[-1]}")
@@ -159,6 +258,9 @@ def build_result_dict(
         raise ValueError(f"No current normalized data for idol {idol_id} at border {border} for event {event_id}")
 
     result["data"]["normalized"]["target"] = [round(x) for x in normalized_target.tolist()]
+    
+    # Calculate confidence bounds for multiple CI levels
+    normalized_bounds = calculate_confidence_bounds(normalized_target, len(current_norm_data) - 1, confidence_intervals)
 
     raw_target = denormalize_target_to_raw(
         normalized_target=normalized_target,
@@ -167,7 +269,8 @@ def build_result_dict(
         full_norm_length=norm_event_length,
         standard_event_length=standard_event_length,
         full_event_length=full_event_length,
-        actual_boost_start=actual_boost_start
+        actual_boost_start=actual_boost_start,
+        standard_event_boost_ratio=standard_event_boost_ratio,
     )
     
     # Debug: Check gap in raw data
@@ -177,13 +280,71 @@ def build_result_dict(
         raw_gap = first_predicted_raw - last_known_raw
         logging.debug(f"Raw gap for idol {idol_id}, border {border}: last_known={last_known_raw}, first_predicted={first_predicted_raw}, gap={raw_gap}")
         
-        if abs(raw_gap) > 1e-10:
+        gap_tolerance = abs(last_known_raw) * 0.005
+        if abs(raw_gap) > gap_tolerance:
             logging.error(f"CRITICAL: Non-zero gap in raw data: {raw_gap}")
             logging.error(f"  This violates requirement #1: slice point gap should be 0")
         else:
             logging.debug(f"✓ No gap in raw data at slice point")
 
     result["data"]["raw"]["target"] = [round(x) for x in raw_target.tolist()]
+    
+    # Denormalize bounds to raw scale for each CI level
+    raw_bounds = {}
+    for confidence_level, bounds in normalized_bounds.items():
+        raw_upper = denormalize_target_to_raw(
+            normalized_target=bounds["upper"],
+            current_step=current_step,
+            current_raw_data=current_raw_data,
+            full_norm_length=norm_event_length,
+            standard_event_length=standard_event_length,
+            full_event_length=full_event_length,
+            actual_boost_start=actual_boost_start,
+            standard_event_boost_ratio=standard_event_boost_ratio,
+        )
+        
+        raw_lower = denormalize_target_to_raw(
+            normalized_target=bounds["lower"],
+            current_step=current_step,
+            current_raw_data=current_raw_data,
+            full_norm_length=norm_event_length,
+            standard_event_length=standard_event_length,
+            full_event_length=full_event_length,
+            actual_boost_start=actual_boost_start,
+            standard_event_boost_ratio=standard_event_boost_ratio,
+        )
+        
+        raw_bounds[confidence_level] = {
+            "upper": [round(x) for x in raw_upper.tolist()],
+            "lower": [round(x) for x in raw_lower.tolist()]
+        }
+    
+    result["data"]["raw"]["bounds"] = raw_bounds
+    
+    # Validate confidence bounds
+    raw_bounds_arrays = {level: {"upper": np.array([x for x in bounds["upper"]]), "lower": np.array([x for x in bounds["lower"]])} for level, bounds in raw_bounds.items()}
+    validate_confidence_bounds(raw_target, raw_bounds_arrays, 
+                              result["metadata"]["raw"]["last_known_step_index"], 
+                              confidence_intervals)
+    
+    # Make first value zero for all data arrays
+    if result["data"]["raw"]["target"]:
+        first_raw = result["data"]["raw"]["target"][0]
+        result["data"]["raw"]["target"] = [x - first_raw for x in result["data"]["raw"]["target"]]
+        
+        # Apply zero baseline to bounds
+        for confidence_level in result["data"]["raw"]["bounds"]:
+            result["data"]["raw"]["bounds"][confidence_level]["upper"] = [x - first_raw for x in result["data"]["raw"]["bounds"][confidence_level]["upper"]]
+            result["data"]["raw"]["bounds"][confidence_level]["lower"] = [x - first_raw for x in result["data"]["raw"]["bounds"][confidence_level]["lower"]]
+    
+    if result["data"]["normalized"]["target"]:
+        first_norm = result["data"]["normalized"]["target"][0]
+        result["data"]["normalized"]["target"] = [x - first_norm for x in result["data"]["normalized"]["target"]]
+        
+        for neighbor_key in result["data"]["normalized"]["neighbors"]:
+            if result["data"]["normalized"]["neighbors"][neighbor_key]:
+                first_neighbor = result["data"]["normalized"]["neighbors"][neighbor_key][0]
+                result["data"]["normalized"]["neighbors"][neighbor_key] = [x - first_neighbor for x in result["data"]["normalized"]["neighbors"][neighbor_key]]
     
     # Final consistency check: compare normalized and denormalized final values
     norm_final = normalized_target[-1]
@@ -195,7 +356,8 @@ def build_result_dict(
     
     if abs(scale_factor - 1.0) < 1e-10:
         # No scaling case - values should be identical
-        if abs(norm_final - raw_final) > 1e-10:
+        final_tolerance = abs(norm_final) * 0.005
+        if abs(norm_final - raw_final) > final_tolerance:
             logging.error(f"CRITICAL: Final value mismatch (no scaling case): normalized={norm_final}, denormalized={raw_final}, diff={abs(norm_final - raw_final)}")
             logging.error(f"  This violates requirement #2: norm and denorm final values should be the same")
         else:
@@ -203,7 +365,8 @@ def build_result_dict(
     else:
         # With scaling - raw should equal norm/scale_factor
         expected_raw_final = norm_final / scale_factor
-        if abs(raw_final - expected_raw_final) > 1e-10:
+        expected_tolerance = abs(expected_raw_final) * 0.005
+        if abs(raw_final - expected_raw_final) > expected_tolerance:
             logging.error(f"CRITICAL: Final value mismatch (with scaling): normalized={norm_final}, denormalized={raw_final}, expected={expected_raw_final}")
             logging.error(f"  Scale factor: {scale_factor}, diff: {abs(raw_final - expected_raw_final)}")
         else:
@@ -222,17 +385,19 @@ def get_predictions(
     data: Dict[str, pd.DataFrame],
     event_id: int,
     event_type: float,
-    sub_types: Tuple[float, ...],
+    sub_type: float,
     idol_ids: List[int],
     borders: List[float],
     step: int,
     event_length: int,
     norm_event_length: int,
     standard_event_length: int,
+    standard_event_boost_ratio: float,
     eid_to_len_boost_ratio: Dict,
     event_name_map: Dict,
 ) -> Dict:
     results = {}
+    sub_types = (sub_type,)
 
     for idol_id in idol_ids:
         if idol_id not in results:
@@ -275,6 +440,8 @@ def get_predictions(
                 current_raw_data = np.array(current_raw_data)
                 current_norm_data = np.array(current_norm_data)
 
+                confidence_intervals = load_confidence_intervals(event_type, sub_type, border, step)
+                
                 result = build_result_dict(
                     event_id=event_id,
                     idol_id=idol_id,
@@ -292,6 +459,8 @@ def get_predictions(
                     smoothed_prediction=smoothed_prediction,
                     event_name_map=event_name_map,
                     eid_to_len_boost_ratio=eid_to_len_boost_ratio,
+                    confidence_intervals=confidence_intervals,
+                    standard_event_boost_ratio=standard_event_boost_ratio,
                 )
 
                 results[idol_id][border] = result

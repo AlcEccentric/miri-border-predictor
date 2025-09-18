@@ -2,7 +2,12 @@ import numpy as np
 import pandas as pd
 import logging
 
-def normalize_consistently(df, full_norm_length, step, standard_event_length, full_event_length, actual_boost_start=None):
+def normalize_consistently(df,
+                           full_norm_length, step,
+                           standard_event_length,
+                           full_event_length,
+                           standard_event_boost_ratio,
+                           actual_boost_start=None):
     """
     Normalize event data consistently while preserving boost timing and score scaling.
     
@@ -30,8 +35,8 @@ def normalize_consistently(df, full_norm_length, step, standard_event_length, fu
     scaled_df['score'] = df['score'] * scale_factor
 
     # Step 2: Determine boost timing for normalization
-    target_boost_ratio = 0.55  # Standard boost ratio
-    target_boost_step = int(target_boost_ratio * full_norm_length)  # e.g., 165 for 300
+    target_boost_ratio = standard_event_boost_ratio  # Standard boost ratio
+    target_boost_step = int(target_boost_ratio * full_norm_length)
 
     # Step 3: Build normalization grid using full_event_length and boost timing
     # This grid is always based on the expected full event, not the length of df
@@ -108,7 +113,12 @@ def normalize_consistently(df, full_norm_length, step, standard_event_length, fu
 
     return result_df
 
-def do_normalize(df, norm_event_length, step, standard_event_length, eid_to_len_boost_ratio):
+def do_normalize(df,
+                 norm_event_length,
+                 step,
+                 standard_event_length,
+                 standard_event_boost_ratio,
+                 eid_to_len_boost_ratio):
     df = df.copy()
     lengths = df.groupby(['event_id', 'idol_id', 'border']).size().reset_index(name='length')
 
@@ -140,6 +150,7 @@ def do_normalize(df, norm_event_length, step, standard_event_length, eid_to_len_
                 full_norm_length=norm_event_length,
                 step=step,
                 standard_event_length=standard_event_length,
+                standard_event_boost_ratio=standard_event_boost_ratio,
                 full_event_length=full_event_len,
                 actual_boost_start=actual_boost_start,
             )
@@ -161,7 +172,13 @@ def do_normalize(df, norm_event_length, step, standard_event_length, eid_to_len_
                                        .cumcount())
     return normalized_all_data
 
-def denormalize_consistently(normalized_scores, full_norm_length, target_length, standard_event_length, full_event_length, actual_boost_start=None):
+def denormalize_consistently(normalized_scores,
+                             full_norm_length,
+                             target_length,
+                             standard_event_length,
+                             full_event_length,
+                             standard_event_boost_ratio,
+                             actual_boost_start=None):
     """
     Revert the normalization process to get original scale scores.
     This matches the logic in normalize_consistently.
@@ -172,7 +189,7 @@ def denormalize_consistently(normalized_scores, full_norm_length, target_length,
     logging.debug(f"Denormalized final score: {scores[-1]}, scale factor: {scale_factor}")
 
     # Step 2: Build mapping from normalized index to raw index (same as in normalization)
-    target_boost_ratio = 0.55
+    target_boost_ratio = standard_event_boost_ratio
     target_boost_step = int(target_boost_ratio * full_norm_length)
 
     if actual_boost_start is not None and actual_boost_start < full_event_length:
@@ -224,7 +241,7 @@ def denormalize_consistently(normalized_scores, full_norm_length, target_length,
 
     return denorm_scores
 
-def denormalize_target_to_raw(normalized_target, current_step, current_raw_data, full_norm_length, standard_event_length, full_event_length, actual_boost_start=None):
+def denormalize_target_to_raw(normalized_target, current_step, current_raw_data, full_norm_length, standard_event_length, standard_event_boost_ratio, full_event_length, actual_boost_start=None):
     """
     Denormalize the full normalized target and replace the known part with actual raw data.
     Ensures continuity at the transition point.
@@ -235,6 +252,7 @@ def denormalize_target_to_raw(normalized_target, current_step, current_raw_data,
         full_norm_length=full_norm_length, 
         target_length=full_event_length, 
         standard_event_length=standard_event_length, 
+        standard_event_boost_ratio=standard_event_boost_ratio,
         full_event_length=full_event_length, 
         actual_boost_start=actual_boost_start,
     )
