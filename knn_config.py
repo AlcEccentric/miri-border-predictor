@@ -84,6 +84,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     """Get default configurations for all groups"""
     configs = {}
 
+    # For シアター & シアタースペシャル
     configs[(3.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=270,
@@ -160,6 +161,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         least_neighbor_id=200,
     )
     
+    # For Tiara & Trust
     configs[(3.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=270,
@@ -238,6 +240,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_use_smooth_for_prediction=True
     )
 
+    # For ツアービンゴスペシャル and ツアービンゴ
     configs[(4.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=260,

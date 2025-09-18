@@ -1,7 +1,8 @@
 import logging
-import math
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import os
 from knn_config import AlignmentMethod, DistanceMetric, get_group_config
 from typing import Dict, List, Tuple, Union
 from scipy.spatial.distance import cdist
@@ -560,8 +561,7 @@ def plot_current_and_neighbors(current_neighbor_data: np.ndarray,
         border: Border value
         output_dir: Directory to save the plot
     """
-    import matplotlib.pyplot as plt
-    import os
+
     # Suppress matplotlib debug logs
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
     logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
@@ -621,29 +621,6 @@ def plot_current_and_neighbors(current_neighbor_data: np.ndarray,
     plt.close()
     
     logging.info(f"Current vs neighbors plot saved to {output_path}")
-    
-    # Also create a summary text file
-    summary_path = os.path.join(output_dir, f'neighbors_summary_e{int(current_event_id)}_i{current_idol_id}_s{current_step}_b{int(border)}.txt')
-    with open(summary_path, 'w') as f:
-        f.write(f"Neighbor Analysis Summary\n")
-        f.write("=" * 30 + "\n\n")
-        f.write(f"Current Event: {int(current_event_id)}\n")
-        f.write(f"Current Idol: {current_idol_id}\n")
-        f.write(f"Current Step: {current_step}\n")
-        f.write(f"Border: {int(border)}\n")
-        f.write(f"Current Score: {current_neighbor_data[-1]:.2f}\n\n")
-        
-        f.write("Neighbors Found:\n")
-        f.write("-" * 20 + "\n")
-        for i, (neighbor_event_id, neighbor_idol_id) in enumerate(similar_ids):
-            # Find neighbor's score at current step
-            for j, (hist_event_id, hist_idol_id) in enumerate(historical_ids):
-                if hist_event_id == neighbor_event_id and hist_idol_id == neighbor_idol_id:
-                    neighbor_score = historical_trajectories[j][current_step-1]
-                    f.write(f"Event {int(neighbor_event_id)}, Idol {neighbor_idol_id}: {neighbor_score:.2f}\n")
-                    break
-    
-    logging.info(f"Neighbor summary saved to {summary_path}")
 
 def plot_neighbors_full_and_prediction(current_partial_data: np.ndarray,
                                      similar_ids: np.ndarray,
@@ -670,9 +647,6 @@ def plot_neighbors_full_and_prediction(current_partial_data: np.ndarray,
         actual_prediction_data: Full prediction data to get real final value
         output_dir: Directory to save the plot
     """
-    import matplotlib.pyplot as plt
-    import os
-
     # Get real final value
     real_full_data_for_avg_prediction = full_data_for_avg_prediction[
         (full_data_for_avg_prediction['event_id'] == current_event_id) & 
@@ -773,35 +747,3 @@ def plot_neighbors_full_and_prediction(current_partial_data: np.ndarray,
     plt.close()
     
     logging.info(f"Full prediction plot saved to {output_path}")
-    
-    # Create detailed summary
-    summary_path = os.path.join(output_dir, f'prediction_summary_e{int(current_event_id)}_i{current_idol_id}_s{current_step}_b{int(border)}.txt')
-    with open(summary_path, 'w') as f:
-        f.write(f"Prediction Analysis Summary\n")
-        f.write("=" * 40 + "\n\n")
-        f.write(f"Current Event: {int(current_event_id)}\n")
-        f.write(f"Current Idol: {current_idol_id}\n")
-        f.write(f"Current Step: {current_step}\n")
-        f.write(f"Border: {int(border)}\n")
-        f.write(f"Current Score: {current_partial_data[-1]:.2f}\n\n")
-        
-        if len(neighbor_prediction) > 0:
-            f.write(f"Predicted Final Score: {neighbor_prediction[-1]:.2f}\n")
-        
-        if len(real_full_data_for_avg_prediction) > 0:
-            real_final_value = real_full_data_for_avg_prediction['score'].values[-1]
-            f.write(f"Real Final Score: {real_final_value:.2f}\n")
-            
-            if len(neighbor_prediction) > 0:
-                prediction_error = abs(neighbor_prediction[-1] - real_final_value)
-                relative_error = (prediction_error / real_final_value) * 100
-                f.write(f"Prediction Error: {prediction_error:.2f}\n")
-                f.write(f"Relative Error: {relative_error:.2f}%\n")
-        
-        f.write(f"\nNeighbors Used:\n")
-        f.write("-" * 20 + "\n")
-        for i, (neighbor_event_id, neighbor_idol_id) in enumerate(similar_ids):
-            neighbor_final = similar_curves[i][-1]
-            f.write(f"Event {int(neighbor_event_id)}, Idol {neighbor_idol_id}: {neighbor_final:.2f}\n")
-    
-    logging.info(f"Prediction summary saved to {summary_path}")

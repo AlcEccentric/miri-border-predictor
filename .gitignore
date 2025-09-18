@@ -8,8 +8,10 @@ venv/
 .env
 .DS_Store
 *.log
-*.csv
 *.json
 *.pkl
 models/
 debug/
+test_results/
+test_data/
+data_cache/

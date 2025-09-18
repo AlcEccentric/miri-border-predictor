@@ -17,6 +17,30 @@ from normalization import do_normalize
 from feature_engineering import add_additional_features
 from smoothing import generate_smoothed_dfs
 
+def filter_data_by_current_step(df: pd.DataFrame, current_step: int, norm_event_length: int, 
+                                event_start_time: str, event_end_time: str) -> pd.DataFrame:
+    """Filter data based on current step timing for testing."""
+    start_time = parser.isoparse(event_start_time)
+    end_time = parser.isoparse(event_end_time)
+    
+    # Calculate the time point corresponding to current_step
+    step_ratio = current_step / norm_event_length
+    event_duration = end_time - start_time
+    cutoff_time = start_time + step_ratio * event_duration
+    
+    logging.debug(f"Step ratio: {step_ratio:.3f}")
+    logging.debug(f"Event duration: {event_duration}")
+    logging.debug(f"Cutoff time: {cutoff_time}")
+    
+    # Filter out rows after cutoff time
+    original_size = len(df)
+    filtered_df = df[df['aggregated_at'] <= cutoff_time].copy()
+    filtered_size = len(filtered_df)
+    
+    logging.debug(f"Filtered data: {original_size} -> {filtered_size} rows ({original_size - filtered_size} removed)")
+    
+    return filtered_df
+
 def should_skip_prediction(metadata: Dict[str, Any]) -> bool:
     # Parse event start and end times (they are in JST)
     jst = pytz.timezone('Asia/Tokyo')
@@ -44,35 +68,44 @@ def should_skip_prediction(metadata: Dict[str, Any]) -> bool:
     logging.info(f"Event running from {event_start} to {event_end}. Current time: {current_time}. Proceeding with prediction.")
     return False
 
-def calculate_standard_event_length(df):
+def calculate_standard_event_length_boost_ratio(df, metadata, eid_to_len_ratio):
     """Calculate standard event length based on most frequent group length"""
-    group_lengths = df.groupby(['event_id', 'idol_id', 'border']).size()
-    length_counts = group_lengths.value_counts().sort_values(ascending=False)
-    
-    # Get the most frequent length safely
-    most_frequent_item = length_counts.index[0]
-    if isinstance(most_frequent_item, tuple):
-        standard_event_length = int(most_frequent_item[0])
+    if metadata['EventType'] == 5:
+        logging.info("Event type 5 detected. Deeming most frequent event as standard.")
+        group_lengths = df.groupby(['event_id', 'idol_id', 'border']).size()
+        length_counts = group_lengths.value_counts().sort_values(ascending=False)
+        
+        # Get the most frequent length safely
+        most_frequent_item = length_counts.index[0]
+        if isinstance(most_frequent_item, tuple):
+            standard_event_length = int(most_frequent_item[0])
+        else:
+            standard_event_length = int(most_frequent_item)
+        
+        logging.info(f"Standard event length (most frequent): {standard_event_length}")
+        logging.debug(f"Length distribution: {dict(length_counts.head())}")
+        
+        return standard_event_length, 0.55
     else:
-        standard_event_length = int(most_frequent_item)
-    
-    logging.info(f"Standard event length (most frequent): {standard_event_length}")
-    logging.debug(f"Length distribution: {dict(length_counts.head())}")
-    
-    return standard_event_length
+        logging.info("Event type not 5. Deeming current event as standard.")
+        cur_idol_id = 0
+        cur_event_id = metadata['EventId']
+        len_and_ratio = eid_to_len_ratio[(cur_event_id, cur_idol_id)]
+        logging.info(f"Standard event length (current): {len_and_ratio['length']}")
+        return len_and_ratio['length'], len_and_ratio['boost_ratio']
 
-def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event_length: int, current_step: int, standard_event_length: int, eid_to_len_boost_ratio: Dict) -> Dict[str, pd.DataFrame]:
+def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event_length: int, current_step: int, standard_event_length: int, standard_event_boost_ratio: float, eid_to_len_boost_ratio: Dict) -> Dict[str, pd.DataFrame]:
     """Prepare the complete data pipeline including normalization, feature engineering, and smoothing"""
     logging.info("Starting data preparation pipeline...")
 
     # Normalize full event data
     logging.info("Normalizing full event data...")
-    norm_df = do_normalize(df[df['event_id'] != metadata['EventId']], norm_event_length, norm_event_length, standard_event_length, eid_to_len_boost_ratio)
+    norm_df = do_normalize(df[df['event_id'] != metadata['EventId']], norm_event_length, norm_event_length, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio)
     
     # Normalize partial event data till current step
     logging.info("Normalizing partial event data...")
     pdf = purge(df, current_step, norm_event_length, eid_to_len_boost_ratio)
-    n_pdf = do_normalize(pdf, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
+    n_pdf = do_normalize(pdf, norm_event_length, current_step, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio)
 
     # Feature engineering
     logging.info("Adding features...")
@@ -114,29 +147,39 @@ def prepare_data_pipeline(df: pd.DataFrame, metadata: Dict[str, Any], norm_event
     logging.info("Data preparation pipeline completed")
     return new_data
 
-def run_predictions(new_data: Dict[str, pd.DataFrame], metadata: Dict[str, Any], borders: list, idol_ids: list, current_step: int, norm_event_length: int, standard_event_length: int, eid_to_len_boost_ratio: Dict, event_name_map: Dict) -> Dict:
+def run_predictions(new_data: Dict[str, pd.DataFrame],
+                    metadata: Dict[str, Any],
+                    borders: list,
+                    idol_ids: list,
+                    current_step: int,
+                    norm_event_length: int,
+                    standard_event_length: int,
+                    standard_event_boost_ratio: float,
+                    eid_to_len_boost_ratio: Dict,
+                    event_name_map: Dict) -> Dict:
     """Run the prediction pipeline"""
     logging.info("Starting predictions...")
 
-    sub_event_types = get_sub_event_types(
+    sub_event_type = get_sub_event_types(
         event_id=metadata['EventId'],
         internal_event_type=metadata['InternalEventType'],
         event_type=metadata['EventType']
-    )
+    )[0]
 
-    logging.info(f"Sub event types: {sub_event_types}")
+    logging.info(f"Sub event types: {sub_event_type}")
 
     results = get_predictions(
         data=new_data,
         event_id=metadata['EventId'],
         event_type=metadata['EventType'],
-        sub_types=sub_event_types,
+        sub_type=sub_event_type,
         idol_ids=idol_ids,
         borders=borders,
         step=current_step,
         event_length=norm_event_length,
         norm_event_length=norm_event_length,
         standard_event_length=standard_event_length,
+        standard_event_boost_ratio=standard_event_boost_ratio,
         eid_to_len_boost_ratio=eid_to_len_boost_ratio,
         event_name_map=event_name_map,
     )
@@ -181,12 +224,12 @@ def main():
     # For testing
     if testing:
         metadata = {
-            'EventId': 378,
-            'EventType': metadata['EventType'],
-            'InternalEventType': metadata['InternalEventType'],
-            'EventName': metadata['EventName'],
-            'StartAt': "2025-04-18T15:00:00+09:00",
-            'EndAt': "2025-04-25T20:59:59+09:00",
+            'EventId': 396,
+            'EventType': 3,
+            'InternalEventType': 3,
+            'EventName': 'piece of cake',
+            'StartAt': "2025-08-31T15:00:00+09:00",
+            'EndAt': "2025-09-08T20:59:59+09:00",
         }
     
     if not testing and should_skip_prediction(metadata) :
@@ -211,17 +254,19 @@ def main():
                                                                idol_ids,
                                                                min_event_id,
                                                                use_local_cache=True if testing else False)
-    standard_event_length = calculate_standard_event_length(df)
+    standard_event_length, standard_event_boost_ratio = calculate_standard_event_length_boost_ratio(df, metadata, eid_to_len_boost_ratio)
     
     current_step = get_current_step(norm_event_length, metadata, df)
-    # For testing
+    # For testing - filter data based on current step
     if testing:
-        current_step = 270
+        current_step = 250
+        df = filter_data_by_current_step(df, current_step, norm_event_length, 
+                                        metadata['StartAt'], metadata['EndAt'])
     logging.info(f"Current step: {current_step}/{norm_event_length}")
 
-    new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, eid_to_len_boost_ratio)
+    new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio)
 
-    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, eid_to_len_boost_ratio, event_name_map)
+    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio, event_name_map)
 
     if results:
         if testing:

@@ -39,46 +39,46 @@ class BatchKNNTester:
         self,
         raw_data: pd.DataFrame,
         steps: List[int],
-        standard_event_length: int,
-        eid_to_len_boost_ratio: Dict,) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]:
-        # Create full normalized data (excluding current event)
-
-        norm_df = do_normalize(
-            raw_data, 
-            self.norm_event_length, 
-            self.norm_event_length, 
-            standard_event_length, 
-            eid_to_len_boost_ratio
-        )
-        norm_feature_df = add_additional_features(norm_df)
-        norm_feature_df['time_idx'] = (norm_feature_df.sort_values('aggregated_at')
-                                        .groupby(['border', 'event_id', 'idol_id']).cumcount())
-        norm_feature_df = norm_feature_df[norm_feature_df['sub_event_type'].isin(self.sub_event_types)]
-        logging.debug(f"Max score for {386.0} is {norm_feature_df[norm_feature_df['event_id'] == 386.0]['score'].max()}")
+        eid_to_len_boost_ratio: Dict,) -> Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]]:
+        # Extract distinct combinations of length and boost_ratio
+        combinations = set()
+        for (event_id, idol_id), params in eid_to_len_boost_ratio.items():
+            length = params['length']
+            boost_ratio = params['boost_ratio']
+            combinations.add((length, boost_ratio))
+    
+        logging.info(f"Found {len(combinations)} distinct combinations of length and boost_ratio")
+        length_to_results = {}
         
-        step_to_norm_part_df = {}
-        for step in steps:
-            pdf = purge(raw_data, step, self.norm_event_length, eid_to_len_boost_ratio)
-            n_pdf = do_normalize(pdf, self.norm_event_length, step, standard_event_length, eid_to_len_boost_ratio)
-            nf_pdf = add_additional_features(n_pdf)
-            nf_pdf['time_idx'] = (nf_pdf.sort_values('aggregated_at')
-                                .groupby(['border', 'event_id', 'idol_id']).cumcount())
-            nf_pdf = nf_pdf[nf_pdf['sub_event_type'].isin(self.sub_event_types)]
-            step_to_norm_part_df[step] = nf_pdf
+        for standard_event_length, standard_event_boost_ratio in combinations:
+            # Create full normalized data
+            norm_df = do_normalize(
+                raw_data, 
+                self.norm_event_length, 
+                self.norm_event_length, 
+                standard_event_length,
+                standard_event_boost_ratio,
+                eid_to_len_boost_ratio
+            )
+            norm_feature_df = add_additional_features(norm_df)
+            norm_feature_df['time_idx'] = (norm_feature_df.sort_values('aggregated_at')
+                                            .groupby(['border', 'event_id', 'idol_id']).cumcount())
+            norm_feature_df = norm_feature_df[norm_feature_df['sub_event_type'].isin(self.sub_event_types)]
+            
+            step_to_norm_part_df = {}
+            for step in steps:
+                pdf = purge(raw_data, step, self.norm_event_length, eid_to_len_boost_ratio)
+                n_pdf = do_normalize(pdf, self.norm_event_length, step, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio)
+                nf_pdf = add_additional_features(n_pdf)
+                nf_pdf['time_idx'] = (nf_pdf.sort_values('aggregated_at')
+                                    .groupby(['border', 'event_id', 'idol_id']).cumcount())
+                nf_pdf = nf_pdf[nf_pdf['sub_event_type'].isin(self.sub_event_types)]
+                step_to_norm_part_df[step] = nf_pdf
+            
+            length_to_results[standard_event_length] = (norm_feature_df, step_to_norm_part_df)
         
-        for step, norm_part_df in step_to_norm_part_df.items():
-            # For each event/idol, check the last value in norm_part_df matches the value at 'step-1' in norm_feature_df
-            for (event_id, idol_id) in norm_part_df[['event_id', 'idol_id']].drop_duplicates().values:
-                if event_id != 386.0:
-                    continue
-                part_scores = norm_part_df[(norm_part_df['event_id'] == event_id) & (norm_part_df['idol_id'] == idol_id)]['score']
-                full_scores = norm_feature_df[(norm_feature_df['event_id'] == event_id) & (norm_feature_df['idol_id'] == idol_id)]['score']
-                if len(part_scores) > 0 and len(full_scores) > step-1:
-                    part_last = part_scores.iloc[-1]
-                    full_at_step = full_scores.iloc[step-1]
-                    if not np.isclose(part_last, full_at_step):
-                        print(f"DEBUG: Mismatch for event {event_id}, idol {idol_id}, step {step}: part_last={part_last}, full_at_step={full_at_step}")
-        return norm_feature_df, step_to_norm_part_df
+        logging.info(f"Processed data for distinct event lengths: {length_to_results.keys()} ")
+        return length_to_results
         
     def load_and_process_data(self) -> Tuple[pd.DataFrame, Dict[int, str]]:
         """Load and process data from local test_data directory."""
@@ -228,10 +228,9 @@ class BatchKNNTester:
     def run_predictions(self, 
                        test_event_ids: List[float],
                        test_steps: List[int],
+                       temp_idol_id: int,
                        raw_data: pd.DataFrame,
-                       norm_df: pd.DataFrame,
-                       nf_pdf_by_step: Dict[int, pd.DataFrame],
-                       standard_event_length: int,
+                       length_to_df_data: Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]],
                        eid_to_len_boost_ratio: Dict) -> List[dict]:
         results = []
         total_combinations = len(test_event_ids) * len(test_steps)
@@ -239,6 +238,8 @@ class BatchKNNTester:
         
         for event_id in test_event_ids:
             logging.info(f"Processing event {event_id}")
+            cur_length = eid_to_len_boost_ratio[(event_id, temp_idol_id)]['length']
+            norm_df, nf_pdf_by_step = length_to_df_data[cur_length]
             
             # Get all idols for this event
             event_idols = norm_df[norm_df['event_id'] == event_id]['idol_id'].unique()
@@ -330,8 +331,11 @@ class BatchKNNTester:
         
         return results
     
-    def save_results(self, results: List[dict], output_file: str):
+    def save_results(self, results: List[dict], output_file: str, dir: str = None):
         """Save results to CSV file."""
+        if dir:
+            Path(dir).mkdir(parents=True, exist_ok=True)
+            output_file = Path(dir) / output_file
         df = pd.DataFrame(results)
         df.to_csv(output_file, index=False)
         logging.info(f"Results saved to {output_file}")
@@ -443,16 +447,19 @@ class BatchKNNTester:
 
 def main():
     # Hardcoded configuration - modify these values as needed
+
     CONFIG = {
-        'event_type': 3.0,
-        'sub_event_types': [2.0],
-        'border': 100.0,
-        'steps': [270],
-        'test_event_ids': [329, 341],  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': None,  # Set to None if using test_event_ids or testing all eventsu
-        'output': 'batch_knn_results.csv',
+        'event_type': 4.0,
+        'sub_event_types': [1.0],
+        'border': 2500.0,
+        'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
+        'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
+        'recent_count': 35,  # Set to None if using test_event_ids or testing all eventsu
         'log_level': 'DEBUG'
     }
+    CONFIG['dir'] = 'test_results'
+    CONFIG['output'] = f'batch_knn_results_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG['border'])}.csv'
+    CONFIG['summary'] = f'batch_knn_summary_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG['border'])}.md'
     
     # Setup logging
     setup_logging()
@@ -476,7 +483,6 @@ def main():
         raw_data, event_name_map = tester.load_and_process_data()
         
         # Calculate standard event length and boost ratios
-        standard_event_length = tester.calculate_standard_event_length(raw_data)
         eid_to_len_boost_ratio = tester.get_len_and_boost_ratio(raw_data)
         
         # Find matching events
@@ -488,10 +494,9 @@ def main():
         
         logging.info(f"Found {len(test_event_ids)} events to test: {test_event_ids}")
 
-        norm_df, nf_pdf_by_step = tester.get_normalized_full_and_part_data(
+        length_to_df_data = tester.get_normalized_full_and_part_data(
             raw_data=raw_data,
             steps=CONFIG['steps'],
-            standard_event_length=standard_event_length,
             eid_to_len_boost_ratio=eid_to_len_boost_ratio
         )
         
@@ -499,18 +504,17 @@ def main():
         all_results = tester.run_predictions(
             test_event_ids=test_event_ids,
             test_steps=CONFIG['steps'],
+            temp_idol_id=1 if CONFIG['event_type'] == 5 else 0,
             raw_data=raw_data,
-            norm_df=norm_df,
-            nf_pdf_by_step=nf_pdf_by_step,
-            standard_event_length=standard_event_length,
-            eid_to_len_boost_ratio=eid_to_len_boost_ratio
+            length_to_df_data=length_to_df_data,
+            eid_to_len_boost_ratio=eid_to_len_boost_ratio,
+
         )
         tester.plot_all_trajectories(raw_data)
-        tester.plot_all_trajectories(norm_df)
         
         # Save results
-        tester.save_results(all_results, CONFIG['output'])
-        tester.save_md_summary(all_results, "batch_knn_summary.md")
+        tester.save_results(all_results, CONFIG['output'], CONFIG['dir'])
+        tester.save_md_summary(all_results, CONFIG['summary'], CONFIG['dir'])
         
     except Exception as e:
         logging.error(f"Error during testing: {str(e)}", exc_info=True)
