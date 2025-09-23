@@ -75,6 +75,29 @@ def validate_confidence_bounds(raw_target: np.ndarray, raw_bounds: Dict[int, Dic
         else:
             logging.debug(f"✓ CI{confidence_level} lower bound relative diff matches: {lower_rel_diff:.6f}")
 
+def cap_confidence_intervals(confidence_intervals: Dict[int, Tuple[float, float]], 
+                            current_value: float,
+                            final_value: float,
+                            current_step: int,
+                            total_steps: int) -> Dict[int, Tuple[float, float]]:
+    """Cap confidence intervals to ensure lower bound is at least ratio * current value."""
+    if current_step < 170:
+        return confidence_intervals
+    capped_intervals = {}
+    ratio = 1.0 + (total_steps / current_step - 1) * 0.5  # 1.0 to 1.2 based on progress
+    min_final_value = ratio * current_value
+    
+    for level, (lower_bound, upper_bound) in confidence_intervals.items():
+        min_lower_bound = (min_final_value / final_value) - 1 if final_value > 0 else lower_bound
+        
+        if lower_bound < min_lower_bound:
+            capped_intervals[level] = (min_lower_bound, upper_bound)
+            logging.debug(f"Capped CI{level} lower bound from {lower_bound:.3f} to {min_lower_bound:.3f}")
+        else:
+            capped_intervals[level] = (lower_bound, upper_bound)
+    
+    return capped_intervals
+
 def load_confidence_intervals(event_type: float, sub_type: float, border: float, step: int) -> Dict[int, Tuple[float, float]]:
     """Load confidence intervals for given parameters."""
     intervals_file = Path("confidence_intervals") / f"confidence_intervals_{int(event_type)}_{int(sub_type)}_{int(border)}.csv"
@@ -138,8 +161,7 @@ def build_result_dict(
             },
             "normalized": {
                 "last_known_step_index": len(current_norm_data) - 1,
-                "neighbors": {},
-                "confidence_intervals": confidence_intervals
+                "neighbors": {}
             }
         },
         "data": {
@@ -267,8 +289,19 @@ def build_result_dict(
 
     result["data"]["normalized"]["target"] = [round(x) for x in normalized_target.tolist()]
     
+    # Cap confidence intervals to ensure lower bound is at least ratio * current value
+    final_norm_value = normalized_target[-1]
+    current_norm_value = normalized_target[len(current_norm_data) - 1]
+    capped_confidence_intervals = cap_confidence_intervals(confidence_intervals,
+                                                           current_norm_value,
+                                                           final_norm_value,
+                                                           len(current_norm_data),
+                                                           norm_event_length)
+    
+    result["metadata"]["normalized"]["confidence_intervals"] = capped_confidence_intervals
+    
     # Calculate confidence bounds for multiple CI levels
-    normalized_bounds = calculate_confidence_bounds(normalized_target, len(current_norm_data) - 1, confidence_intervals)
+    normalized_bounds = calculate_confidence_bounds(normalized_target, len(current_norm_data) - 1, capped_confidence_intervals)
 
     raw_target = denormalize_target_to_raw(
         normalized_target=normalized_target,
@@ -333,7 +366,7 @@ def build_result_dict(
     raw_bounds_arrays = {level: {"upper": np.array([x for x in bounds["upper"]]), "lower": np.array([x for x in bounds["lower"]])} for level, bounds in raw_bounds.items()}
     validate_confidence_bounds(raw_target, raw_bounds_arrays, 
                               result["metadata"]["raw"]["last_known_step_index"], 
-                              confidence_intervals)
+                              capped_confidence_intervals)
     
     # Make first value zero for all data arrays
     if result["data"]["raw"]["target"]:
