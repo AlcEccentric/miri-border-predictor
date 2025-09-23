@@ -359,8 +359,11 @@ class BatchKNNTester:
         else:
             print("No results generated!")
     
-    def save_md_summary(self, results: List[dict], output_md: str):
+    def save_md_summary(self, results: List[dict], output_md: str, dir: str):
         """Save step-wise error summary to a Markdown file, including event IDs with error > 10% and their errors."""
+        if dir:
+            Path(dir).mkdir(parents=True, exist_ok=True)
+            output_md = Path(dir) / output_md
         df = pd.DataFrame(results)
         if len(df) == 0:
             with open(output_md, "w") as f:
@@ -449,7 +452,7 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 4.0,
+        'event_type': 11.0,
         'sub_event_types': [1.0],
         'border': 2500.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
@@ -458,8 +461,8 @@ def main():
         'log_level': 'DEBUG'
     }
     CONFIG['dir'] = 'test_results'
-    CONFIG['output'] = f'batch_knn_results_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG['border'])}.csv'
-    CONFIG['summary'] = f'batch_knn_summary_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG['border'])}.md'
+    CONFIG['output'] = f'batch_knn_results_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG["border"])}.csv'
+    CONFIG['summary'] = f'batch_knn_summary_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG["border"])}.md'
     
     # Setup logging
     setup_logging()
