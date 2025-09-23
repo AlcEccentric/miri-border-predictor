@@ -372,7 +372,76 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.LINEAR: 0.0
         }
     )
-    
+
+    # For Tune
+    configs[(11.0, (1.0,), 100.0)] = GroupConfig(
+        early_stage_end=140,
+        mid_stage_end=250,
+        early_stage_k=6,
+        mid_stage_k=3,
+        late_stage_k=3,
+        disable_scale=False,
+        early_stage_lookback=50,
+        mid_stage_lookback=35,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=60,
+        mid_stage_lookback_for_align=35,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        
+        early_stage_use_smooth_for_neighbors=True,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        
+        early_stage_use_smooth_for_prediction=True,
+        mid_stage_use_smooth_for_prediction=True,
+        late_stage_use_smooth_for_prediction=True
+    )
+
+    configs[(11.0, (1.0,), 2500.0)] = GroupConfig(
+        early_stage_end=150,
+        mid_stage_end=240,
+        early_stage_k=3,
+        mid_stage_k=5,
+        late_stage_k=5,
+        disable_scale=False,
+        early_stage_lookback=50,
+        mid_stage_lookback=15,
+        late_stage_lookback=15,
+        early_stage_lookback_for_align=75,
+        mid_stage_lookback_for_align=25,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.7,
+            AlignmentMethod.LINEAR: 0.2,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        
+        early_stage_use_smooth_for_neighbors=True,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        
+        early_stage_use_smooth_for_prediction=True,
+        mid_stage_use_smooth_for_prediction=True,
+        late_stage_use_smooth_for_prediction=True
+    )
+
     return configs
 
 GROUP_CONFIGS: Dict[Tuple[float, Tuple[float], float], GroupConfig] = get_default_group_configs()
