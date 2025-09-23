@@ -84,8 +84,8 @@ def cap_confidence_intervals(confidence_intervals: Dict[int, Tuple[float, float]
     if current_step < 170:
         return confidence_intervals
     capped_intervals = {}
-    ratio = 1.0 + (total_steps / current_step - 1) * 0.5  # 1.0 to 1.2 based on progress
-    min_final_value = ratio * current_value
+    ratio = total_steps / current_step
+    min_final_value = min(ratio * current_value, final_value)
     
     for level, (lower_bound, upper_bound) in confidence_intervals.items():
         min_lower_bound = (min_final_value / final_value) - 1 if final_value > 0 else lower_bound
