@@ -18,15 +18,37 @@ def calculate_confidence_bounds(normalized_target: np.ndarray,
         lower_series = normalized_target.copy()
         
         if last_known_step_index + 1 < len(normalized_target):
+            current_value = normalized_target[last_known_step_index]
             remaining_points = len(normalized_target) - (last_known_step_index + 1)
+            
             for i in range(last_known_step_index + 1, len(normalized_target)):
                 progress = (i - last_known_step_index - 1) / (remaining_points - 1) if remaining_points > 1 else 1
                 
+                # Apply upper bound normally
                 upper_delta = progress * upper_bound
                 upper_series[i] = (1 + upper_delta) * normalized_target[i]
                 
+                # Apply lower bound with proper constraints
                 lower_delta = progress * lower_bound
-                lower_series[i] = (1 + lower_delta) * normalized_target[i]
+                unconstrained_lower = (1 + lower_delta) * normalized_target[i]
+                predicted_value = normalized_target[i]
+                
+                # Calculate progress from current step to this step
+                steps_from_current = i - last_known_step_index
+                total_future_steps = len(normalized_target) - last_known_step_index - 1
+                step_progress = steps_from_current / total_future_steps if total_future_steps > 0 else 1
+                
+                # Ensure lower bound is sensible:
+                # 1. Never below current value (with small minimum growth)
+                # 2. Never above the prediction itself
+                min_reasonable_bound = current_value * (1 + step_progress * 0.01)  # At least 1% total growth
+                max_reasonable_bound = predicted_value  # Never above prediction
+                
+                # Apply constraints in order
+                constrained_lower = max(unconstrained_lower, min_reasonable_bound)
+                constrained_lower = min(constrained_lower, max_reasonable_bound)
+                
+                lower_series[i] = constrained_lower
         
         bounds[confidence_level] = {
             "upper": upper_series,
@@ -71,9 +93,29 @@ def validate_confidence_bounds(raw_target: np.ndarray, raw_bounds: Dict[int, Dic
             logging.debug(f"✓ CI{confidence_level} upper bound relative diff matches: {upper_rel_diff:.6f}")
         
         if abs(lower_rel_diff - expected_lower) > lower_tolerance:
-            logging.error(f"CRITICAL: CI{confidence_level} lower bound relative diff mismatch: got {lower_rel_diff:.6f}, expected {expected_lower:.6f}")
+            # For lower bound, check if it was constrained by minimum growth or max prediction
+            lower_growth_from_current = (lower_final - target_at_last) / target_at_last if target_at_last != 0 else 0
+            if lower_growth_from_current >= 0.01 and lower_final <= target_final:  # If constraints were applied
+                logging.info(f"CI{confidence_level} lower bound was constrained: got {lower_rel_diff:.6f}, expected {expected_lower:.6f}, growth from current: {lower_growth_from_current:.6f}")
+            else:
+                logging.error(f"CRITICAL: CI{confidence_level} lower bound relative diff mismatch: got {lower_rel_diff:.6f}, expected {expected_lower:.6f}")
         else:
             logging.debug(f"✓ CI{confidence_level} lower bound relative diff matches: {lower_rel_diff:.6f}")
+        
+        # Check 3: Lower bound shows sensible growth from current value and doesn't exceed prediction
+        lower_growth_from_current = (lower_final - target_at_last) / target_at_last if target_at_last != 0 else 0
+        if lower_growth_from_current < 0:
+            logging.warning(f"CI{confidence_level} lower bound shows negative growth from current: {lower_growth_from_current:.6f}")
+        elif lower_growth_from_current < 0.005:
+            logging.warning(f"CI{confidence_level} lower bound shows very low growth from current: {lower_growth_from_current:.6f}")
+        else:
+            logging.debug(f"✓ CI{confidence_level} lower bound shows reasonable growth from current: {lower_growth_from_current:.6f}")
+        
+        # Check 4: Lower bound should never exceed prediction
+        if lower_final > target_final:
+            logging.error(f"CRITICAL: CI{confidence_level} lower bound ({lower_final}) exceeds prediction ({target_final})")
+        else:
+            logging.debug(f"✓ CI{confidence_level} lower bound is below prediction: lower={lower_final}, pred={target_final}")
 
 def cap_confidence_intervals(confidence_intervals: Dict[int, Tuple[float, float]], 
                             current_value: float,

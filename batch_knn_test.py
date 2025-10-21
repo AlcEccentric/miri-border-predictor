@@ -452,8 +452,8 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 11.0,
-        'sub_event_types': [1.0],
+        'event_type': 4.0,
+        'sub_event_types': [2.0],
         'border': 2500.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
