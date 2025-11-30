@@ -59,7 +59,7 @@ def should_skip_prediction(metadata: Dict[str, Any]) -> bool:
         return True
 
     event_duration = event_end - event_start
-    first_tenth_end = event_start + (event_duration / 10)
+    first_tenth_end = event_start + (event_duration / 222)
     
     if current_time <= first_tenth_end:
         logging.info(f"Current time {current_time} is within first 1/10 of event (until {first_tenth_end}). Skipping prediction.")
