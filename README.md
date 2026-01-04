@@ -2,6 +2,13 @@
 
 ## Local testing guide
 
+If you want to refresh the data for testing, delete the directories under test_data and run r2_downloader.py.
+A sample command to refresh all directories:
+
+```
+python3 r2_downloader.py --bucket mltd-border-predict
+```
+
 The `batch_knn_test.py` is for local testing purpose. Update the `CONFIG` in the main()
 method to configure the testing.
 

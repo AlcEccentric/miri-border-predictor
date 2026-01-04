@@ -452,9 +452,9 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 4.0,
-        'sub_event_types': [2.0],
-        'border': 100.0,
+        'event_type': 13.0,
+        'sub_event_types': [1.0],
+        'border': 2500.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
         'recent_count': 35,  # Set to None if using test_event_ids or testing all eventsu
@@ -477,7 +477,7 @@ def main():
         event_type=CONFIG['event_type'],
         sub_event_types=CONFIG['sub_event_types'],
         border=CONFIG['border'],
-        min_event_id=100,
+        min_event_id=150,
     )
     
     try:

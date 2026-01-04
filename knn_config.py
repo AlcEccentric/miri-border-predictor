@@ -442,6 +442,64 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_use_smooth_for_prediction=True
     )
 
+    # For Tale
+    configs[(13.0, (1.0,), 100.0)] = GroupConfig(
+        early_stage_end=100,
+        mid_stage_end=195,
+        early_stage_k=5,
+        mid_stage_k=4,
+        late_stage_k=4,
+        disable_scale=False,
+        early_stage_lookback=50,
+        mid_stage_lookback=25,
+        late_stage_lookback=24,
+        early_stage_lookback_for_align=60,
+        mid_stage_lookback_for_align=55,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_use_ensemble=False,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        early_stage_use_smooth_for_neighbors=False,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        early_stage_use_smooth_for_prediction=True,
+        mid_stage_use_smooth_for_prediction=True,
+        late_stage_use_smooth_for_prediction=True
+    )
+
+    configs[(13.0, (1.0,), 2500.0)] = GroupConfig(
+        early_stage_end=115,
+        mid_stage_end=195,
+        early_stage_k=5,
+        mid_stage_k=2,
+        late_stage_k=2,
+        disable_scale=False,
+        early_stage_scale_cap=(0.5, 2),
+        mid_stage_scale_cap=(0.9, 1.1),
+        late_stage_scale_cap=(0.9, 1.1),
+        early_stage_lookback=50,
+        mid_stage_lookback=50,
+        late_stage_lookback=25,
+        early_stage_lookback_for_align=50,
+        mid_stage_lookback_for_align=25,
+        late_stage_lookback_for_align=25, 
+        early_stage_metric=DistanceMetric.RMSE,
+        mid_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_use_ensemble=False,
+        mid_stage_use_ensemble=False,
+        late_stage_use_ensemble=False,
+        early_stage_use_smooth_for_neighbors=False,
+        mid_stage_use_smooth_for_neighbors=False,
+        late_stage_use_smooth_for_neighbors=False,
+        early_stage_use_smooth_for_prediction=True,
+        mid_stage_use_smooth_for_prediction=True,
+        late_stage_use_smooth_for_prediction=True
+    )
+
     return configs
 
 GROUP_CONFIGS: Dict[Tuple[float, Tuple[float], float], GroupConfig] = get_default_group_configs()
