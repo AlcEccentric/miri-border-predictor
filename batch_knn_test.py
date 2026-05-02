@@ -96,7 +96,17 @@ class BatchKNNTester:
         e_info = pd.read_csv(event_info_path)
         e_info = self.filter_event_info(e_info)
         
-        logging.info(f"Loaded event info with {len(e_info)} events")
+        # Parse end_at early so we can filter out ongoing events
+        e_info['end_at'] = pd.to_datetime(e_info['end_at'])
+        now = pd.Timestamp.now(tz='Asia/Tokyo')
+        ongoing_events = e_info[e_info['end_at'] >= now]
+        if len(ongoing_events) > 0:
+            ongoing_ids = ongoing_events['event_id'].tolist()
+            ongoing_names = ongoing_events['name'].tolist()
+            logging.info(f"Filtering out {len(ongoing_events)} ongoing event(s): {list(zip(ongoing_ids, ongoing_names))}")
+            e_info = e_info[e_info['end_at'] < now]
+        
+        logging.info(f"Loaded event info with {len(e_info)} past events")
         
         # Load border info files
         border_info_dir = test_data_dir / "border_info"
@@ -140,9 +150,8 @@ class BatchKNNTester:
         if 'aggregated_at' in b_info.columns:
             b_info['aggregated_at'] = pd.to_datetime(b_info['aggregated_at'])
         
-        # Ensure datetime conversion for event info columns
-        datetime_columns = ['start_at', 'end_at', 'boost_at']
-        for col in datetime_columns:
+        # Ensure datetime conversion for event info columns (end_at already parsed above)
+        for col in ['start_at', 'boost_at']:
             if col in e_info.columns:
                 e_info[col] = pd.to_datetime(e_info[col])
         e_info['end_at'] = e_info['end_at'] + pd.Timedelta(seconds=1) # round data to o'clock time
@@ -452,13 +461,13 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 13.0,
+        'event_type': 11.0,
         'sub_event_types': [1.0],
         'border': 2500.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': 35,  # Set to None if using test_event_ids or testing all eventsu
-        'log_level': 'DEBUG'
+        'recent_count': 10,  # Set to None if using test_event_ids or testing all eventsu
+        'log_level': 'INFO'
     }
     CONFIG['dir'] = 'test_results'
     CONFIG['output'] = f'batch_knn_results_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG["border"])}.csv'
