@@ -272,7 +272,7 @@ def main():
         if testing:
             save_predictions_to_local_debug(r2_client, results, metadata['EventId'])
         else:
-            upload_predictions_to_r2(r2_client, results, metadata['EventId'])
+            upload_predictions_to_r2(r2_client, results, metadata['EventId'], current_step=current_step)
         logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
     else:
         logging.warning("No results to upload")
@@ -282,7 +282,7 @@ def main():
 def get_min_event_id(internal_event_type: int) -> int:
     if internal_event_type in [22, 23]: # TourBingo & TourSpecial
         return 250
-    elif internal_event_type in [13, 24, 25]: # テール & チーム & タイム
+    elif internal_event_type in [11, 13, 24, 25]: # Tune & テール & チーム & タイム
         return 150
     return 200
 
