@@ -59,33 +59,76 @@ def save_predictions_to_local_debug(
 def upload_predictions_to_r2(
     r2_client: R2Client,
     results: Dict,
-    event_id: int
+    event_id: int,
+    current_step: Optional[int] = None,
+    history_step_interval: int = 30,
 ) -> None:
+    """Upload prediction JSONs to R2.
+
+    Each (idol_id, border) result is always written to:
+        prediction/{idol_id}/{border}/predictions.json  (the latest)
+
+    If ``current_step`` is provided and is a non-zero multiple of
+    ``history_step_interval`` (default 30), the same JSON is also written
+    to a step-stamped snapshot path so past predictions can be referenced:
+        prediction_history/{event_id}/step_{step}/{idol_id}/{border}/predictions.json
+    """
     logging.info("Uploading prediction results to R2...")
-    
+
     # Get event name mapping once
     event_mapping = get_event_name_mapping_from_r2(r2_client)
     event_name = event_mapping.get(event_id, "Unknown Event")
-    
+
+    snapshot_step: Optional[int] = None
+    if current_step is not None and current_step > 0 and current_step % history_step_interval == 0:
+        snapshot_step = current_step
+        logging.info(
+            f"current_step={current_step} is a multiple of {history_step_interval}; "
+            f"also writing snapshot under prediction_history/{event_id}/step_{snapshot_step}/"
+        )
+
     uploaded_count = 0
+    snapshot_count = 0
     for idol_id, borders_data in results.items():
         for border, result_dict in borders_data.items():
             json_data = json.dumps(result_dict, indent=2)
+            body = json_data.encode('utf-8')
 
-            file_key = f'prediction/{idol_id}/{border}/predictions.json'
+            # Latest prediction (unchanged path)
+            latest_key = f'prediction/{idol_id}/{border}/predictions.json'
             try:
                 r2_client.put_object(
                     bucket_name=BUCKET_NAME,
-                    key=file_key,
-                    body=json_data.encode('utf-8'),
-                    ContentType='application/json'
+                    key=latest_key,
+                    body=body,
+                    ContentType='application/json',
                 )
                 uploaded_count += 1
                 logging.info(f"Uploaded prediction for idol {idol_id}, border {border}")
             except Exception as e:
                 logging.error(f"Error uploading prediction for idol {idol_id}, border {border}: {e}", exc_info=True)
-    
+
+            # Optional historic snapshot
+            if snapshot_step is not None:
+                snapshot_key = (
+                    f'prediction_history/{event_id}/step_{snapshot_step}/'
+                    f'{idol_id}/{border}/predictions.json'
+                )
+                try:
+                    r2_client.put_object(
+                        bucket_name=BUCKET_NAME,
+                        key=snapshot_key,
+                        body=body,
+                        ContentType='application/json',
+                    )
+                    snapshot_count += 1
+                    logging.debug(f"Uploaded snapshot for idol {idol_id}, border {border} at {snapshot_key}")
+                except Exception as e:
+                    logging.error(f"Error uploading snapshot for idol {idol_id}, border {border}, step {snapshot_step}: {e}", exc_info=True)
+
     logging.info(f"Successfully uploaded {uploaded_count} prediction files to R2 for event: {event_name}")
+    if snapshot_step is not None:
+        logging.info(f"Also uploaded {snapshot_count} step-{snapshot_step} snapshot files under prediction_history/{event_id}/")
 
 def _process_border_and_event_data(
     border_info: pd.DataFrame,
