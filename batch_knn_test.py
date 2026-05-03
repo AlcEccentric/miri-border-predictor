@@ -169,7 +169,7 @@ class BatchKNNTester:
         
     def find_matching_events(self, raw_data: pd.DataFrame, 
                            test_event_ids: Optional[List[float]] = None,
-                           recent_count: Optional[int] = None) -> List[float]:
+                           recent_count: Optional[Union[int, float]] = None) -> List[float]:
         matching_events = raw_data['event_id'].unique()
         if test_event_ids is not None:
             available_events = [eid for eid in test_event_ids if eid in matching_events]
@@ -178,7 +178,17 @@ class BatchKNNTester:
             return available_events
         elif recent_count is not None:
             sorted_events = sorted(matching_events, reverse=True)
-            return sorted_events[:recent_count]
+            n_total = len(sorted_events)
+            if isinstance(recent_count, float) and not float(recent_count).is_integer():
+                if not 0 < recent_count <= 1:
+                    raise ValueError(f"recent_count as float must be in (0, 1], got {recent_count}")
+                n_take = max(1, int(round(n_total * recent_count)))
+            else:
+                n_take = int(recent_count)
+                if n_take <= 0:
+                    raise ValueError(f"recent_count as int must be > 0, got {recent_count}")
+            logging.info(f"Selecting {n_take} most recent events out of {n_total} qualified")
+            return sorted_events[:n_take]
         else:
             return list(raw_data['event_id'].unique())
     
@@ -466,7 +476,7 @@ def main():
         'border': 2500.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': 10,  # Set to None if using test_event_ids or testing all eventsu
+        'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
         'log_level': 'INFO'
     }
     CONFIG['dir'] = 'test_results'
