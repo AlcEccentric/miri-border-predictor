@@ -46,6 +46,46 @@ def _dtw_distance(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
     return float(cost[-1, -1])
 
 
+# ---------------------------------------------------------------------------
+# SLOPE_AWARE distance
+# ---------------------------------------------------------------------------
+
+def _slope_aware_distance(
+    current_window: np.ndarray,
+    candidate_window: np.ndarray,
+    config,
+) -> float:
+    """Distance blending level and slope RMSEs.
+
+        D_level = RMSE(x - y)        / (|mean(x)| + eps)
+        D_slope = RMSE(diff(x) - diff(y)) / (|mean(diff(x))| + eps)
+        D       = (1 - slope_weight) * D_level + slope_weight * D_slope
+
+    Each component is relativised by the current window's own magnitude
+    (or mean slope) so the two terms are commensurable before blending.
+    """
+    L = len(current_window)
+    if L < 2:
+        return float(np.sqrt(np.mean((current_window - candidate_window) ** 2)))
+
+    a_slope = float(config.slope_weight)
+    a_level = max(0.0, 1.0 - a_slope)
+
+    eps = 1e-9
+
+    # Level term
+    diff_values = current_window - candidate_window
+    scale_level = float(np.abs(np.mean(current_window))) + eps
+    d_level = float(np.sqrt(np.mean(diff_values ** 2))) / scale_level
+
+    # Slope term (L - 1 points)
+    diff_slope = np.diff(current_window) - np.diff(candidate_window)
+    scale_slope = float(np.abs(np.mean(np.diff(current_window)))) + eps
+    d_slope = float(np.sqrt(np.mean(diff_slope ** 2))) / scale_slope
+
+    return a_level * d_level + a_slope * d_slope
+
+
 def trajectory_distance(
     current_partial: np.ndarray,
     candidate_partial: np.ndarray,
@@ -77,6 +117,8 @@ def trajectory_distance(
         return _dtw_distance(current_window, candidate_window)
     if metric == DistanceMetric.RMSE:
         return float(np.sqrt(np.mean((current_window - candidate_window) ** 2)))
+    if metric == DistanceMetric.SLOPE_AWARE:
+        return _slope_aware_distance(current_window, candidate_window, config)
     # FINAL_DIFF: mean absolute difference in the lookback window
     return float(np.mean(np.abs(current_window - candidate_window)))
 

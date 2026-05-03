@@ -9,6 +9,7 @@ class DistanceMetric(Enum):
     RMSE = 'rmse'
     DTW = 'dtw'
     FINAL_DIFF = 'final_diff'
+    SLOPE_AWARE = 'slope_aware'
 
 class AlignmentMethod(Enum):
     LINEAR = 'linear'
@@ -58,6 +59,13 @@ class GroupConfig:
     trend_weight: float = 0.3
     smoothing_window: Optional[int] = None
     outlier_threshold: float = 2.5
+
+    # --- SLOPE_AWARE distance metric -------------------------------------
+    # Active only where a stage's metric is DistanceMetric.SLOPE_AWARE.
+    # D = (1 - slope_weight) * D_level + slope_weight * D_slope
+    # Each component is an RMSE divided by a scale derived from the current
+    # window's own magnitude / mean |slope|.
+    slope_weight: float = 0.5
 
 
     early_stage_scale_cap: Tuple[float, float] = (0.5, 2)
@@ -409,21 +417,21 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     )
 
     configs[(11.0, (1.0,), 2500.0)] = GroupConfig(
-        early_stage_end=150,
-        mid_stage_end=240,
+        early_stage_end=190,
+        mid_stage_end=250,
         early_stage_k=3,
         mid_stage_k=5,
         late_stage_k=5,
         disable_scale=False,
         early_stage_lookback=50,
         mid_stage_lookback=15,
-        late_stage_lookback=15,
+        late_stage_lookback=25,
         early_stage_lookback_for_align=75,
         mid_stage_lookback_for_align=25,
         late_stage_lookback_for_align=25, 
         early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        mid_stage_metric=DistanceMetric.SLOPE_AWARE,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
