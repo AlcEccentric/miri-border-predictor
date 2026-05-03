@@ -1,6 +1,6 @@
 import datetime
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from dateutil import parser
 import pytz
@@ -16,6 +16,7 @@ from r2_client import R2Client
 from normalization import do_normalize
 from feature_engineering import add_additional_features
 from smoothing import generate_smoothed_dfs
+from knn_config import get_group_config
 
 def filter_data_by_current_step(df: pd.DataFrame, current_step: int, norm_event_length: int, 
                                 event_start_time: str, event_end_time: str) -> pd.DataFrame:
@@ -244,7 +245,19 @@ def main():
     borders = [100.0, 1000.0] if target == 'anniversary' else [100.0, 2500.0]
     idol_ids = list(range(1, 53)) if target == 'anniversary' else [0]
     logging.info(f"Using borders: {borders}")
-    min_event_id = get_min_event_id(metadata['InternalEventType'])
+
+    # Determine min_event_id. Prefer per-(event_type, sub_type, border) value
+    # from GroupConfig; fall back to internal-event-type-based default.
+    sub_event_types = get_sub_event_types(
+        event_id=metadata['EventId'],
+        internal_event_type=metadata['InternalEventType'],
+        event_type=float(metadata['EventType']),
+    )
+    min_event_id = resolve_min_event_id(
+        event_type=float(metadata['EventType']),
+        sub_event_types=sub_event_types,
+        borders=borders,
+    )
     logging.info(f"Using min event id: {min_event_id}")
 
     # Load data and calculate parameters
@@ -279,12 +292,41 @@ def main():
 
     return results
 
-def get_min_event_id(internal_event_type: int) -> int:
-    if internal_event_type in [22, 23]: # TourBingo & TourSpecial
-        return 250
-    elif internal_event_type in [11, 13, 24, 25]: # Tune & テール & チーム & タイム
-        return 150
-    return 200
+def resolve_min_event_id(
+    event_type: float,
+    sub_event_types: Tuple[float, ...],
+    borders: List[float],
+) -> int:
+    """Pick the ``min_event_id`` to use for data loading.
+
+    ``min_event_id`` is conceptually a property of ``(event_type, sub_event_types)``
+    rather than per-border, so all borders' ``GroupConfig.min_event_id`` values
+    for the same event_type+sub_event_types must agree. Raises if they differ
+    or if any configured group leaves the field as ``None``.
+    """
+    per_border: Dict[float, Optional[float]] = {}
+    for border in borders:
+        cfg = get_group_config(event_type, sub_event_types, border)
+        per_border[border] = cfg.min_event_id
+
+    missing = [b for b, v in per_border.items() if v is None]
+    if missing:
+        raise ValueError(
+            f"GroupConfig.min_event_id not set for event_type={event_type} "
+            f"sub_event_types={sub_event_types} at border(s)={missing}. "
+            f"Configure it in knn_config.py."
+        )
+
+    unique_values = set(per_border.values())
+    if len(unique_values) > 1:
+        raise ValueError(
+            f"GroupConfig.min_event_id differs across borders for "
+            f"event_type={event_type} sub_event_types={sub_event_types}: {per_border}. "
+            f"min_event_id must be the same for all borders of the same "
+            f"(event_type, sub_event_types)."
+        )
+
+    return int(next(iter(unique_values)))
 
 def get_sub_event_types(event_id: int, internal_event_type: int, event_type: float) -> Tuple[float, ...]:
     """

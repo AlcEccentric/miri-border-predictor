@@ -87,6 +87,10 @@ class GroupConfig:
     use_error_bounds: bool = False
     error_bound_std_multiplier: float = 2.0
     least_neighbor_id: float = 100.0
+    # Lower bound on event_id for historical data loaded for this group.
+    # Used by main.py's data loader to decide how far back to fetch. Must be
+    # set per group; main.resolve_min_event_id raises if left as None.
+    min_event_id: Optional[float] = None
 
 def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], GroupConfig]:
     """Get default configurations for all groups"""
