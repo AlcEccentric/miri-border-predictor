@@ -384,7 +384,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     # For Tune
     configs[(11.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=140,
-        mid_stage_end=250,
+        mid_stage_end=190,
         early_stage_k=6,
         mid_stage_k=3,
         late_stage_k=3,
@@ -397,7 +397,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_lookback_for_align=25, 
         early_stage_metric=DistanceMetric.RMSE,
         mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
