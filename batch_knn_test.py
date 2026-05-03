@@ -22,17 +22,20 @@ from feature_engineering import add_additional_features
 from logger_config import setup_logging
 
 class BatchKNNTester:
-    def __init__(self, event_type: float, sub_event_types: List[float], border: float, min_event_id: int):
+    def __init__(self, event_type: float, sub_event_types: List[float], border: float, look_back_event_cnt: int):
         self.event_type = event_type
         self.sub_event_types = sub_event_types
         self.border = border
-        self.min_event_id = min_event_id
+        # Include only events whose id >= (ongoing_event_id - look_back_event_cnt).
+        # Populated in load_and_process_data once the ongoing event is identified.
+        self.look_back_event_cnt = look_back_event_cnt
+        self.min_event_id: int = 150
         self.results = []
         self.norm_event_length = 300
 
     def filter_event_info(self, e_info: pd.DataFrame) -> pd.DataFrame:
-        """Filter event info based on event type, sub event types, and border."""
-        return e_info[(e_info['event_type'] == self.event_type) & 
+        """Filter event info by event_type and min_event_id."""
+        return e_info[(e_info['event_type'] == self.event_type) &
                       (e_info['event_id'] >= self.min_event_id)]
 
     def get_normalized_full_and_part_data(
@@ -94,18 +97,23 @@ class BatchKNNTester:
             raise FileNotFoundError(f"Event info file not found at {event_info_path}")
         
         e_info = pd.read_csv(event_info_path)
-        e_info = self.filter_event_info(e_info)
-        
-        # Parse end_at early so we can filter out ongoing events
+
+        # min_event_id is derived from the latest event_id in the file minus
+        # the lookback count. Ongoing events are filtered out after the
+        # datetime parsing below.
+        latest_event_id = int(e_info['event_id'].max())
+        self.min_event_id = latest_event_id - self.look_back_event_cnt
+        logging.info(
+            f"latest_event_id={latest_event_id}, look_back_event_cnt={self.look_back_event_cnt} "
+            f"-> min_event_id={self.min_event_id}"
+        )
+
+        # Drop ongoing events and apply the type + min_event_id filter
         e_info['end_at'] = pd.to_datetime(e_info['end_at'])
         now = pd.Timestamp.now(tz='Asia/Tokyo')
-        ongoing_events = e_info[e_info['end_at'] >= now]
-        if len(ongoing_events) > 0:
-            ongoing_ids = ongoing_events['event_id'].tolist()
-            ongoing_names = ongoing_events['name'].tolist()
-            logging.info(f"Filtering out {len(ongoing_events)} ongoing event(s): {list(zip(ongoing_ids, ongoing_names))}")
-            e_info = e_info[e_info['end_at'] < now]
-        
+        e_info = self.filter_event_info(e_info)
+        e_info = e_info[e_info['end_at'] < now]
+
         logging.info(f"Loaded event info with {len(e_info)} past events")
         
         # Load border info files
@@ -477,6 +485,7 @@ def main():
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
         'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
+        'look_back_event_cnt': 250,  # include only the N most recent past events of this event_type as candidates
         'log_level': 'INFO'
     }
     CONFIG['dir'] = 'test_results'
@@ -496,7 +505,7 @@ def main():
         event_type=CONFIG['event_type'],
         sub_event_types=CONFIG['sub_event_types'],
         border=CONFIG['border'],
-        min_event_id=150,
+        look_back_event_cnt=CONFIG['look_back_event_cnt'],
     )
     
     try:
