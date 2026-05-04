@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from knn_config import AlignmentMethod, DistanceMetric, GroupConfig
+from src.knn.config import AlignmentMethod, DistanceMetric, GroupConfig
 
 
 # ---------------------------------------------------------------------------

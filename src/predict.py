@@ -4,8 +4,8 @@ import numpy as np
 import logging
 from pathlib import Path
 
-from knn import get_filtered_df, predict_curve_knn
-from normalization import denormalize_target_to_raw
+from src.knn import get_filtered_df, predict_curve_knn
+from src.core.normalization import denormalize_target_to_raw
 
 def calculate_confidence_bounds(normalized_target: np.ndarray,
                                 last_known_step_index: int,
@@ -140,36 +140,60 @@ def cap_confidence_intervals(confidence_intervals: Dict[int, Tuple[float, float]
     
     return capped_intervals
 
-def load_confidence_intervals(event_type: float, sub_type: float, border: float, step: int) -> Dict[int, Tuple[float, float]]:
-    """Load confidence intervals for given parameters."""
-    intervals_file = Path("confidence_intervals") / f"confidence_intervals_{int(event_type)}_{int(sub_type)}_{int(border)}.csv"
-    
-    if not intervals_file.exists():
-        raise FileNotFoundError(f"Confidence intervals file not found: {intervals_file}")
-    
-    df = pd.read_csv(intervals_file)
+_CI_CACHE: Dict[Tuple[float, float, float], pd.DataFrame] = {}
+
+
+def load_confidence_intervals(
+    event_type: float,
+    sub_type: float,
+    border: float,
+    step: int,
+    r2_client=None,
+) -> Dict[int, Tuple[float, float]]:
+    """Load confidence intervals for given parameters from R2.
+
+    The per-(event_type, sub_type, border) CSV is fetched once per process
+    and cached in ``_CI_CACHE``. If R2 access is unavailable and the caller
+    did not supply a client, raises (no local-disk fallback by design).
+    """
+    from src.storage.loader import load_ci_csv_from_r2
+    from src.storage.r2_client import R2Client
+
+    cache_key = (float(event_type), float(sub_type), float(border))
+    if cache_key not in _CI_CACHE:
+        client = r2_client or R2Client()
+        _CI_CACHE[cache_key] = load_ci_csv_from_r2(client, event_type, sub_type, border)
+    df = _CI_CACHE[cache_key]
+
     step_data = df[df['step'] == step]
-    
+
     # If exact step not found, find closest step within 25 steps
     if step_data.empty:
         available_steps = df['step'].unique()
         closest_step = min(available_steps, key=lambda x: abs(x - step))
-        
+
         if abs(closest_step - step) > 25:
-            raise ValueError(f"No confidence interval data found within 25 steps of step {step} in {intervals_file}. Closest available step: {closest_step}")
-        
+            raise ValueError(
+                f"No confidence interval data found within 25 steps of step {step} "
+                f"for (event_type={event_type}, sub_type={sub_type}, border={border}). "
+                f"Closest available step: {closest_step}"
+            )
+
         step_data = df[df['step'] == closest_step]
         logging.info(f"Using closest step {closest_step} for requested step {step}")
-    
+
     intervals_map = {}
     for _, row in step_data.iterrows():
         intervals_map[int(row['confidence_level'])] = (row['rel_error_lower_bound'], row['rel_error_upper_bound'])
-    
+
     required_levels = {75, 90}
     missing_levels = required_levels - set(intervals_map.keys())
     if missing_levels:
-        raise ValueError(f"Missing required confidence levels {sorted(missing_levels)} for step {step} in {intervals_file}")
-    
+        raise ValueError(
+            f"Missing required confidence levels {sorted(missing_levels)} for step {step} "
+            f"(event_type={event_type}, sub_type={sub_type}, border={border})"
+        )
+
     return intervals_map
 
 def build_result_dict(
@@ -478,6 +502,7 @@ def get_predictions(
     standard_event_boost_ratio: float,
     eid_to_len_boost_ratio: Dict,
     event_name_map: Dict,
+    r2_client=None,
 ) -> Dict:
     results = {}
     sub_types = (sub_type,)
@@ -523,7 +548,7 @@ def get_predictions(
                 current_raw_data = np.array(current_raw_data)
                 current_norm_data = np.array(current_norm_data)
 
-                confidence_intervals = load_confidence_intervals(event_type, sub_type, border, step)
+                confidence_intervals = load_confidence_intervals(event_type, sub_type, border, step, r2_client=r2_client)
                 
                 result = build_result_dict(
                     event_id=event_id,

@@ -29,8 +29,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-from knn_config import AlignmentMethod
-from knn_stage import scores_of
+from src.knn.config import AlignmentMethod
+from src.knn.stage import scores_of
 
 
 # ---------------------------------------------------------------------------

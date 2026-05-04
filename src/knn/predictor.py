@@ -33,19 +33,19 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
-from knn_alignment import (
+from src.knn.alignment import (
     ensemble_predict,
     fetch_neighbor_trajectories,
     single_method_predict,
 )
-from knn_config import AlignmentMethod, get_group_config
-from knn_distance import build_candidate_set, find_nearest_neighbors
-from knn_plotting import (
+from src.knn.config import AlignmentMethod, get_group_config
+from src.knn.distance import build_candidate_set, find_nearest_neighbors
+from src.knn.plotting import (
     is_debug_logging,
     plot_current_and_neighbors,
     plot_neighbors_full_and_prediction,
 )
-from knn_stage import get_stage_params, scores_of, select_data_sources
+from src.knn.stage import get_stage_params, scores_of, select_data_sources
 
 
 MIN_CURRENT_SCORE = 5000  # skip minor idols whose latest score is too low to predict

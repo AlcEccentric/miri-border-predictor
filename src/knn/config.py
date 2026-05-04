@@ -516,10 +516,35 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
 
 GROUP_CONFIGS: Dict[Tuple[float, Tuple[float], float], GroupConfig] = get_default_group_configs()
 
+# Optional overlay populated at runtime from R2 by main.py. A mapping from
+# (event_type, sub_event_types, border) to a dict of {field_name: value} that
+# should shadow the source config. Today only ``min_event_id`` is overlaid.
+_DYNAMIC_OVERLAY: Dict[Tuple[float, Tuple[float, ...], float], Dict[str, object]] = {}
+
+
+def set_dynamic_overlay(overlay: Dict[Tuple[float, Tuple[float, ...], float], Dict[str, object]]) -> None:
+    """Install a dynamic overlay. Replaces any previous overlay."""
+    global _DYNAMIC_OVERLAY
+    _DYNAMIC_OVERLAY = dict(overlay)
+
+
+def clear_dynamic_overlay() -> None:
+    global _DYNAMIC_OVERLAY
+    _DYNAMIC_OVERLAY = {}
+
+
 def get_group_config(event_type: float, sub_types: Tuple[float], border: float) -> GroupConfig:
-    """Get configuration for specific group"""
+    """Get configuration for specific group, with dynamic overlay applied."""
     key = (event_type, sub_types, border)
     if key not in GROUP_CONFIGS:
         logging.warning(f'Group config not found for {key}')
         GROUP_CONFIGS[key] = GroupConfig()
-    return GROUP_CONFIGS[key]
+    base = GROUP_CONFIGS[key]
+
+    overlay = _DYNAMIC_OVERLAY.get(key)
+    if not overlay:
+        return base
+
+    # Shallow copy with overlay fields replaced
+    from dataclasses import replace
+    return replace(base, **{k: v for k, v in overlay.items() if hasattr(base, k)})

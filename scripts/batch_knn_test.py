@@ -13,22 +13,30 @@ import sys
 from datetime import datetime
 
 # Import your existing modules
-from knn import predict_curve_knn
-from data_processing import combine_info, process_data, purge
-from normalization import do_normalize
-from interpolation import interpolate
-from smoothing import generate_smoothed_dfs
-from feature_engineering import add_additional_features
+from src.knn import predict_curve_knn
+from src.core.data_processing import combine_info, process_data, purge
+from src.core.normalization import do_normalize
+from src.core.interpolation import interpolate
+from src.core.smoothing import generate_smoothed_dfs
+from src.core.feature_engineering import add_additional_features
 from logger_config import setup_logging
 
 class BatchKNNTester:
-    def __init__(self, event_type: float, sub_event_types: List[float], border: float, look_back_event_cnt: int):
+    def __init__(
+        self,
+        event_type: float,
+        sub_event_types: List[float],
+        border: float,
+        look_back_event_cnt: int,
+        data_dir: str = "test_data",
+    ):
         self.event_type = event_type
         self.sub_event_types = sub_event_types
         self.border = border
         # Include only events whose id >= (ongoing_event_id - look_back_event_cnt).
         # Populated in load_and_process_data once the ongoing event is identified.
         self.look_back_event_cnt = look_back_event_cnt
+        self.data_dir = data_dir
         self.min_event_id: int = 150
         self.results = []
         self.norm_event_length = 300
@@ -84,12 +92,12 @@ class BatchKNNTester:
         return length_to_results
         
     def load_and_process_data(self) -> Tuple[pd.DataFrame, Dict[int, str]]:
-        """Load and process data from local test_data directory."""
-        logging.info("Loading data from local test_data directory...")
-        
-        test_data_dir = Path("test_data")
+        """Load and process data from ``self.data_dir`` (default: ``test_data``)."""
+        logging.info(f"Loading data from local directory: {self.data_dir}")
+
+        test_data_dir = Path(self.data_dir)
         if not test_data_dir.exists():
-            raise FileNotFoundError("test_data directory not found. Please ensure it exists with the same structure as R2 bucket.")
+            raise FileNotFoundError(f"{self.data_dir} directory not found. Please ensure it exists with the same structure as R2 bucket.")
         
         # Load event info
         event_info_path = test_data_dir / "event_info" / "event_info_all.csv"
@@ -98,22 +106,21 @@ class BatchKNNTester:
         
         e_info = pd.read_csv(event_info_path)
 
-        # min_event_id is derived from the latest event_id in the file minus
-        # the lookback count. Ongoing events are filtered out after the
-        # datetime parsing below.
+        # Drop ongoing events before anything derives ids/windows from them.
+        e_info['end_at'] = pd.to_datetime(e_info['end_at'])
+        now = pd.Timestamp.now(tz='Asia/Tokyo')
+        e_info = e_info[e_info['end_at'] < now]
+
+        # min_event_id is derived from the latest past event_id minus the
+        # lookback count.
         latest_event_id = int(e_info['event_id'].max())
         self.min_event_id = latest_event_id - self.look_back_event_cnt
         logging.info(
-            f"latest_event_id={latest_event_id}, look_back_event_cnt={self.look_back_event_cnt} "
+            f"latest_past_event_id={latest_event_id}, look_back_event_cnt={self.look_back_event_cnt} "
             f"-> min_event_id={self.min_event_id}"
         )
 
-        # Drop ongoing events and apply the type + min_event_id filter
-        e_info['end_at'] = pd.to_datetime(e_info['end_at'])
-        now = pd.Timestamp.now(tz='Asia/Tokyo')
         e_info = self.filter_event_info(e_info)
-        e_info = e_info[e_info['end_at'] < now]
-
         logging.info(f"Loaded event info with {len(e_info)} past events")
         
         # Load border info files

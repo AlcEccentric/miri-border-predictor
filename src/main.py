@@ -9,14 +9,15 @@ import numpy as np
 # Import logger configuration first
 import logger_config
 
-from loader import load_all_data, load_latest_event_metadata_from_r2, save_predictions_to_local_debug, upload_predictions_to_r2
-from data_processing import purge
-from predict import get_predictions
-from r2_client import R2Client
-from normalization import do_normalize
-from feature_engineering import add_additional_features
-from smoothing import generate_smoothed_dfs
-from knn_config import get_group_config
+from src.storage.loader import load_all_data, load_latest_event_metadata_from_r2, save_predictions_to_local_debug, upload_predictions_to_r2
+from src.core.data_processing import purge
+from src.predict import get_predictions
+from src.storage.r2_client import R2Client
+from src.core.normalization import do_normalize
+from src.core.feature_engineering import add_additional_features
+from src.core.smoothing import generate_smoothed_dfs
+from src.knn.config import get_group_config, set_dynamic_overlay
+from src.storage.dynamic_config import load_dynamic_config_from_r2
 
 def filter_data_by_current_step(df: pd.DataFrame, current_step: int, norm_event_length: int, 
                                 event_start_time: str, event_end_time: str) -> pd.DataFrame:
@@ -157,7 +158,8 @@ def run_predictions(new_data: Dict[str, pd.DataFrame],
                     standard_event_length: int,
                     standard_event_boost_ratio: float,
                     eid_to_len_boost_ratio: Dict,
-                    event_name_map: Dict) -> Dict:
+                    event_name_map: Dict,
+                    r2_client=None) -> Dict:
     """Run the prediction pipeline"""
     logging.info("Starting predictions...")
 
@@ -183,6 +185,7 @@ def run_predictions(new_data: Dict[str, pd.DataFrame],
         standard_event_boost_ratio=standard_event_boost_ratio,
         eid_to_len_boost_ratio=eid_to_len_boost_ratio,
         event_name_map=event_name_map,
+        r2_client=r2_client,
     )
     
     logging.info("Predictions completed")
@@ -217,8 +220,21 @@ def get_current_step(norm_event_length: int, metadata: Dict[str, Any], df: pd.Da
 
 def main():
     logging.info("Starting border prediction pipeline...")
-    
+
     r2_client = R2Client()
+
+    # Load the dynamic config overlay from R2 and install it before any
+    # downstream code reads a GroupConfig field. Single source of truth for
+    # min_event_id (and future dynamic fields).
+    from src.storage.loader import BUCKET_NAME
+    dynamic_cfg = load_dynamic_config_from_r2(r2_client, BUCKET_NAME)
+    overlay = {
+        e.key(): {k: v for k, v in {"min_event_id": e.min_event_id}.items() if v is not None}
+        for e in dynamic_cfg.entries
+    }
+    set_dynamic_overlay(overlay)
+    logging.info(f"Installed dynamic overlay generation_id={dynamic_cfg.generation_id} ({len(overlay)} groups)")
+
     metadata = load_latest_event_metadata_from_r2(r2_client=r2_client)
     testing = False
 
@@ -279,7 +295,7 @@ def main():
 
     new_data = prepare_data_pipeline(df, metadata, norm_event_length, current_step, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio)
 
-    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio, event_name_map)
+    results = run_predictions(new_data, metadata, borders, idol_ids, current_step, norm_event_length, standard_event_length, standard_event_boost_ratio, eid_to_len_boost_ratio, event_name_map, r2_client=r2_client)
 
     if results:
         if testing:
