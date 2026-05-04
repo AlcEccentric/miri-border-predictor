@@ -486,13 +486,13 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 11.0,
-        'sub_event_types': [1.0],
-        'border': 2500.0,
+        'event_type': 3.0,
+        'sub_event_types': [2.0],
+        'border': 100.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
         'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
-        'look_back_event_cnt': 250,  # include only the N most recent past events of this event_type as candidates
+        'look_back_event_cnt': 225,  # include only the N most recent past events of this event_type as candidates
         'log_level': 'INFO'
     }
     CONFIG['dir'] = 'test_results'

@@ -50,29 +50,49 @@ def _fit_alignment(
     ``neighbor_scores`` is the neighbour's partial trajectory (matching the
     length of ``current_scores``). Only the window ``[align_start:align_end]``
     is used for the fit.
+
+    The ``scale_cap`` applies to all three methods. When a fitted scale is
+    clamped, the offset is recomputed to keep a natural anchor point:
+        - LINEAR: anchors the first point of the align window.
+        - AFFINE / RATIO: anchors the last point of the align window.
     """
     neighbor_window = neighbor_scores[align_start:align_end]
     current_window = current_scores[align_start:align_end]
+    scale_low, scale_high = scale_cap
+
+    def _clamped(raw_scale: float) -> float:
+        if raw_scale > scale_high:
+            logging.debug(f"[{method.value}] scale {raw_scale:.4f} hit upper bound {scale_high}")
+            return scale_high
+        if raw_scale < scale_low:
+            logging.debug(f"[{method.value}] scale {raw_scale:.4f} hit lower bound {scale_low}")
+            return scale_low
+        return raw_scale
 
     if method == AlignmentMethod.LINEAR:
-        scale = (current_window[-1] - current_window[0]) / (neighbor_window[-1] - neighbor_window[0])
+        raw_scale = (current_window[-1] - current_window[0]) / (neighbor_window[-1] - neighbor_window[0])
+        scale = _clamped(float(raw_scale))
+        # Anchor the first point.
         offset = current_window[0] - scale * neighbor_window[0]
         return float(scale), float(offset)
 
     if method == AlignmentMethod.AFFINE:
         model = LinearRegression().fit(neighbor_window.reshape(-1, 1), current_window)
-        return float(model.coef_[0]), float(model.intercept_)
+        raw_scale = float(model.coef_[0])
+        raw_offset = float(model.intercept_)
+        scale = _clamped(raw_scale)
+        # If the scale was clamped, re-anchor the last point so the aligned
+        # curve still lines up with the current trajectory's present value.
+        if scale == raw_scale:
+            offset = raw_offset
+        else:
+            offset = float(current_window[-1] - scale * neighbor_window[-1])
+        return float(scale), offset
 
-    # RATIO: scale = mean(current) / mean(neighbor), clamped to scale_cap,
-    # then offset chosen so the last scaled point matches the last current point.
-    scale = float(np.mean(current_window) / np.mean(neighbor_window))
-    scale_low, scale_high = scale_cap
-    if scale > scale_high:
-        logging.debug(f"Scale {scale} hit upper bound: {scale_high}")
-        scale = scale_high
-    if scale < scale_low:
-        logging.debug(f"Scale {scale} hit lower bound: {scale_low}")
-        scale = scale_low
+    # RATIO: scale = mean(current) / mean(neighbor), clamped, then offset
+    # chosen so the last scaled point matches the last current point.
+    raw_scale = float(np.mean(current_window) / np.mean(neighbor_window))
+    scale = _clamped(raw_scale)
     offset = float(current_window[-1] - scale * neighbor_window[-1])
     return scale, offset
 
@@ -248,6 +268,7 @@ def single_method_predict(
     align_lookback: Optional[int],
     scale_cap: Tuple[float, float],
     disable_scale: bool,
+    neighbor_ids: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Weighted average of neighbour curves aligned with a single method."""
     if align_lookback is None:
@@ -276,7 +297,18 @@ def single_method_predict(
         )
         aligned_curves.append(aligned)
 
-    return np.average(aligned_curves, axis=0, weights=weights)
+    prediction = np.average(aligned_curves, axis=0, weights=weights)
+    _log_neighbor_summary(
+        neighbor_ids=neighbor_ids,
+        distances=distances,
+        weights=weights,
+        neighbor_full_list=neighbor_full_list,
+        aligned_curves_by_method={method: aligned_curves},
+        method_weights={method: 1.0},
+        final_prediction=prediction,
+        strategy="single_method",
+    )
+    return prediction
 
 
 def ensemble_predict(
@@ -289,6 +321,7 @@ def ensemble_predict(
     method_weights: Dict[AlignmentMethod, float],
     scale_cap: Tuple[float, float],
     disable_scale: bool,
+    neighbor_ids: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Blend per-method predictions using ``method_weights``.
 
@@ -305,6 +338,7 @@ def ensemble_predict(
     ratio_upper *= (1 + TOLERANCE)
 
     per_method_predictions: List[np.ndarray] = []
+    aligned_by_method: Dict[AlignmentMethod, List[np.ndarray]] = {}
     for method in AlignmentMethod:
         aligned_curves: List[np.ndarray] = []
         for neighbor_full, neighbor_partial in zip(neighbor_full_list, neighbor_partial_list):
@@ -318,6 +352,7 @@ def ensemble_predict(
                 align_start, align_end, ratio_lower, ratio_upper,
             )
             aligned_curves.append(aligned)
+        aligned_by_method[method] = aligned_curves
         per_method_predictions.append(
             np.average(aligned_curves, axis=0, weights=neighbor_weights)
         )
@@ -325,4 +360,73 @@ def ensemble_predict(
     blended = np.zeros_like(per_method_predictions[0])
     for pred, method in zip(per_method_predictions, AlignmentMethod):
         blended += pred * method_weights[method]
+
+    _log_neighbor_summary(
+        neighbor_ids=neighbor_ids,
+        distances=distances,
+        weights=neighbor_weights,
+        neighbor_full_list=neighbor_full_list,
+        aligned_curves_by_method=aligned_by_method,
+        method_weights=method_weights,
+        final_prediction=blended,
+        strategy="ensemble",
+    )
     return blended
+
+
+# ---------------------------------------------------------------------------
+# Debug logging
+# ---------------------------------------------------------------------------
+
+def _log_neighbor_summary(
+    neighbor_ids: Optional[np.ndarray],
+    distances: np.ndarray,
+    weights: np.ndarray,
+    neighbor_full_list: List[np.ndarray],
+    aligned_curves_by_method: Dict[AlignmentMethod, List[np.ndarray]],
+    method_weights: Dict[AlignmentMethod, float],
+    final_prediction: np.ndarray,
+    strategy: str,
+) -> None:
+    """Emit a compact per-neighbour summary at INFO level.
+
+    Shows distance, normalized weight, each neighbour's own final score
+    (pre-alignment), and the aligned final score per alignment method.
+    Helpful when one neighbour dominates the prediction unexpectedly.
+    """
+    if not logging.getLogger().isEnabledFor(logging.INFO):
+        return
+
+    n = len(distances)
+    method_list = list(aligned_curves_by_method.keys())
+    method_col_width = 10
+
+    header = f"KNN neighbours ({strategy}, k={n}):"
+    # Column layout: idx | (eid,iid) | distance | weight | own_final | <per-method aligned_final>
+    fixed = f"{'idx':>3} {'id':>14} {'dist':>10} {'weight':>7} {'own_final':>11}"
+    method_header = " ".join(f"{m.value:>{method_col_width}}" for m in method_list)
+    logging.info(header + "\n  " + fixed + " " + method_header)
+
+    for i in range(n):
+        eid, iid = (neighbor_ids[i] if neighbor_ids is not None else (-1, -1))
+        own_final = float(neighbor_full_list[i][-1])
+        aligned_finals = " ".join(
+            f"{float(aligned_curves_by_method[m][i][-1]):>{method_col_width}.0f}"
+            for m in method_list
+        )
+        logging.info(
+            f"  {i:>3d} ({int(eid):>4d},{int(iid):>2d}) "
+            f"{float(distances[i]):>10.2f} {float(weights[i]):>7.3f} "
+            f"{own_final:>11.0f} {aligned_finals}"
+        )
+
+    if strategy == "ensemble":
+        # Per-method weighted-average final, pre-blend
+        per_method_final = {
+            m: float(np.average([c[-1] for c in aligned_curves_by_method[m]], weights=weights))
+            for m in method_list
+        }
+        parts = " ".join(f"{m.value}={per_method_final[m]:.0f}(w={method_weights[m]:.2f})" for m in method_list)
+        logging.info(f"  per-method finals: {parts}")
+
+    logging.info(f"  blended final prediction: {float(final_prediction[-1]):.0f}")

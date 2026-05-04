@@ -68,9 +68,9 @@ class GroupConfig:
     slope_weight: float = 0.5
 
 
-    early_stage_scale_cap: Tuple[float, float] = (0.5, 2)
-    mid_stage_scale_cap: Tuple[float, float] = (0.5, 2)
-    late_stage_scale_cap: Tuple[float, float] = (0.5, 2)
+    early_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
+    mid_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
+    late_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
 
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
@@ -97,6 +97,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     configs = {}
 
     # For シアター & シアタースペシャル
+    # TODO: Try slope aware
     configs[(3.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=270,
@@ -105,7 +106,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_k=3,
         disable_scale=False,
         early_stage_scale_cap=(0.9, 1.1),
-        mid_stage_scale_cap=(0.8, 1.3),
+        mid_stage_scale_cap=(0.8, 1.2),
         late_stage_scale_cap=(0.9, 1.1),
         early_stage_lookback=5,
         mid_stage_lookback=5,
@@ -175,9 +176,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     
     # For Tiara & Trust
     configs[(3.0, (2.0,), 100.0)] = GroupConfig(
-        early_stage_end=170,
-        mid_stage_end=270,
-        early_stage_k=6,
+        early_stage_end=160,
+        mid_stage_end=220,
+        early_stage_k=5,
         mid_stage_k=5,
         late_stage_k=5,
         disable_scale=False,
@@ -187,9 +188,10 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_lookback_for_align=60,
         mid_stage_lookback_for_align=35,
         late_stage_lookback_for_align=25, 
-        early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_metric=DistanceMetric.SLOPE_AWARE,
+        mid_stage_metric=DistanceMetric.SLOPE_AWARE,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
+        slope_weight=0.6,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
@@ -200,6 +202,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.LINEAR: 0.2,
             AlignmentMethod.RATIO: 0.1
         },
+        early_stage_scale_cap=(0.5, 2),
+        mid_stage_scale_cap=(0.8, 1.2),
+        late_stage_scale_cap=(0.8, 1.2),
         early_stage_use_ensemble=True,
         mid_stage_use_ensemble=True,
         late_stage_use_ensemble=False,
@@ -226,9 +231,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_lookback_for_align=45,
         mid_stage_lookback_for_align=35,
         late_stage_lookback_for_align=25, 
-        early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_metric=DistanceMetric.SLOPE_AWARE,
+        mid_stage_metric=DistanceMetric.SLOPE_AWARE,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
@@ -239,6 +244,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.LINEAR: 0.2,
             AlignmentMethod.RATIO: 0.1
         },
+        early_stage_scale_cap=(0.9, 1.1),
+        mid_stage_scale_cap=(0.9, 1.1),
+        late_stage_scale_cap=(0.9, 1.1),
         early_stage_use_ensemble=True,
         mid_stage_use_ensemble=True,
         late_stage_use_ensemble=False,
@@ -253,6 +261,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     )
 
     # For ツアービンゴスペシャル and ツアービンゴ
+    # TODO: Try slope aware
     configs[(4.0, (2.0,), 100.0)] = GroupConfig(
         early_stage_end=170,
         mid_stage_end=260,
@@ -262,7 +271,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         disable_scale=False,
         early_stage_scale_cap=(0.5, 2),
         mid_stage_scale_cap=(0.5, 2),
-        late_stage_scale_cap=(0.9, 1.1),
+        late_stage_scale_cap=(0.5, 2),
         early_stage_lookback=50,
         mid_stage_lookback=20,
         late_stage_lookback=10,
@@ -290,7 +299,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         mid_stage_k=3,
         late_stage_k=3,
         disable_scale=False,
-        early_stage_scale_cap=(0.5, 2),
+        early_stage_scale_cap=(0.8, 1.2),
         mid_stage_scale_cap=(0.9, 1.1),
         late_stage_scale_cap=(0.9, 1.1),
         early_stage_lookback=50,
@@ -402,6 +411,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_metric=DistanceMetric.RMSE,
         mid_stage_metric=DistanceMetric.FINAL_DIFF,
         late_stage_metric=DistanceMetric.SLOPE_AWARE,
+        early_stage_scale_cap=(0.65, 1.35),
+        mid_stage_scale_cap=(0.8, 1.2),
+        late_stage_scale_cap=(0.8, 1.2),  
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
@@ -441,6 +453,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.LINEAR: 0.2,
             AlignmentMethod.RATIO: 0.1
         },
+        early_stage_scale_cap=(0.9, 1.1),
+        mid_stage_scale_cap=(0.85, 1.15),
+        late_stage_scale_cap=(0.8, 1.2),
         early_stage_use_ensemble=True,
         mid_stage_use_ensemble=False,
         late_stage_use_ensemble=False,
@@ -489,7 +504,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         mid_stage_k=2,
         late_stage_k=3,
         disable_scale=False,
-        early_stage_scale_cap=(0.5, 2),
+        early_stage_scale_cap=(0.9, 1.1),
         mid_stage_scale_cap=(0.9, 1.1),
         late_stage_scale_cap=(0.9, 1.1),
         early_stage_lookback=50,

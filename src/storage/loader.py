@@ -62,17 +62,22 @@ def upload_predictions_to_r2(
     event_id: int,
     current_step: Optional[int] = None,
     history_step_interval: int = 30,
+    dry_run: bool = False,
 ) -> None:
     """Upload prediction JSONs to R2.
 
-    Each (idol_id, border) result is always written to:
-        prediction/{idol_id}/{border}/predictions.json  (the latest)
+    Normal mode writes to:
+        prediction/{idol_id}/{border}/predictions.json                              (latest)
+        prediction_history/{event_id}/step_{step}/{idol_id}/{border}/predictions.json  (every 30 steps)
 
-    If ``current_step`` is provided and is a non-zero multiple of
-    ``history_step_interval`` (default 30), the same JSON is also written
-    to a step-stamped snapshot path so past predictions can be referenced:
-        prediction_history/{event_id}/step_{step}/{idol_id}/{border}/predictions.json
+    ``dry_run=True`` mirrors the layout under a ``dry_run/`` prefix so the
+    production paths are never touched:
+        dry_run/prediction/{idol_id}/{border}/predictions.json
+        dry_run/prediction_history/{event_id}/step_{step}/{idol_id}/{border}/predictions.json
     """
+    prefix = "dry_run/" if dry_run else ""
+    if dry_run:
+        logging.info("Dry-run mode: uploading to dry_run/ prefix (production paths untouched)")
     logging.info("Uploading prediction results to R2...")
 
     # Get event name mapping once
@@ -84,7 +89,7 @@ def upload_predictions_to_r2(
         snapshot_step = current_step
         logging.info(
             f"current_step={current_step} is a multiple of {history_step_interval}; "
-            f"also writing snapshot under prediction_history/{event_id}/step_{snapshot_step}/"
+            f"also writing snapshot under {prefix}prediction_history/{event_id}/step_{snapshot_step}/"
         )
 
     uploaded_count = 0
@@ -94,8 +99,8 @@ def upload_predictions_to_r2(
             json_data = json.dumps(result_dict, indent=2)
             body = json_data.encode('utf-8')
 
-            # Latest prediction (unchanged path)
-            latest_key = f'prediction/{idol_id}/{border}/predictions.json'
+            # Latest prediction
+            latest_key = f'{prefix}prediction/{idol_id}/{border}/predictions.json'
             try:
                 r2_client.put_object(
                     bucket_name=BUCKET_NAME,
@@ -104,14 +109,14 @@ def upload_predictions_to_r2(
                     ContentType='application/json',
                 )
                 uploaded_count += 1
-                logging.info(f"Uploaded prediction for idol {idol_id}, border {border}")
+                logging.info(f"Uploaded prediction for idol {idol_id}, border {border} -> {latest_key}")
             except Exception as e:
                 logging.error(f"Error uploading prediction for idol {idol_id}, border {border}: {e}", exc_info=True)
 
             # Optional historic snapshot
             if snapshot_step is not None:
                 snapshot_key = (
-                    f'prediction_history/{event_id}/step_{snapshot_step}/'
+                    f'{prefix}prediction_history/{event_id}/step_{snapshot_step}/'
                     f'{idol_id}/{border}/predictions.json'
                 )
                 try:
@@ -128,7 +133,7 @@ def upload_predictions_to_r2(
 
     logging.info(f"Successfully uploaded {uploaded_count} prediction files to R2 for event: {event_name}")
     if snapshot_step is not None:
-        logging.info(f"Also uploaded {snapshot_count} step-{snapshot_step} snapshot files under prediction_history/{event_id}/")
+        logging.info(f"Also uploaded {snapshot_count} step-{snapshot_step} snapshot files under {prefix}prediction_history/{event_id}/")
 
 def _process_border_and_event_data(
     border_info: pd.DataFrame,
@@ -453,14 +458,24 @@ def load_all_data(r2_client: R2Client,
                   target: str,
                   idol_ids: List[int],
                   min_event_id: int,
-                  use_local_cache: bool = False) -> Tuple[pd.DataFrame, Dict[Tuple[int, int], Dict[str, any]], Dict[int, str]]: # type: ignore
+                  use_local_cache: bool = False,
+                  local_cache_dir: str = './data_cache') -> Tuple[pd.DataFrame, Dict[Tuple[int, int], Dict[str, any]], Dict[int, str]]: # type: ignore
     logging.info("Loading data from R2...")
     if target == 'normal':
         logging.info("Loading normal data from R2...")
-        b_info, e_info = load_data_from_r2(r2_client, metadata['EventId'], metadata['EventType'], min_event_id=min_event_id, use_local_cache=use_local_cache)
+        b_info, e_info = load_data_from_r2(
+            r2_client, metadata['EventId'], metadata['EventType'],
+            min_event_id=min_event_id,
+            use_local_cache=use_local_cache,
+            local_cache_dir=local_cache_dir,
+        )
     else:
         logging.info("Loading anniversary data from R2...")
-        b_info, e_info = load_anniversary_data_from_r2(r2_client, use_local_cache=use_local_cache)
+        b_info, e_info = load_anniversary_data_from_r2(
+            r2_client,
+            use_local_cache=use_local_cache,
+            local_cache_dir=local_cache_dir,
+        )
 
     eid_to_len_boost_ratio = get_len_and_boost_ratio(event_info=e_info, idol_ids=idol_ids)
     # Extract event_id to name mapping
