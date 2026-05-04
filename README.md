@@ -58,12 +58,39 @@ All commands run from the repo root. Use `python3 -m …` so the `src.` and
 
 ```bash
 python3 -m src.main
+# equivalent to:
+python3 -m src.main --mode production
 ```
 
 Reads the latest event metadata, loads input data from R2, loads the
 dynamic config overlay from R2 (`config/latest/dynamic_config.json`) and
 per-group CI files (`ci/latest/confidence_intervals_{et}_{sub}_{border}.csv`),
-computes predictions, and uploads them.
+computes predictions, and uploads them to
+`prediction/{idol_id}/{border}/predictions.json`.
+
+### Dry-run prediction (safe for local testing)
+
+```bash
+python3 -m src.main --mode dry_run
+python3 -m src.main --mode dry_run_with_cache_refresh
+```
+
+Both variants:
+
+- Upload predictions to `dry_run/prediction/...` in R2 instead of the
+  production path, so live consumers are untouched.
+- Cache event/border input data at `local_cache/main/` (picked up by the
+  dataframe pickles in `load_all_data`).
+- Bypass the `should_skip_prediction` timing gate so you can test outside
+  the active event window.
+
+`dry_run` reuses whatever is already cached at `local_cache/main/` — fast
+re-runs during iteration. `dry_run_with_cache_refresh` wipes that
+directory first so the next load pulls fresh data from R2 — use when you
+suspect stale cached inputs are hiding a real issue.
+
+Pair with `--log-level DEBUG` if you want the per-neighbour weight
+breakdown from the KNN core.
 
 ### Offline knn test (hyperparam optimization)
 

@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,6 +19,16 @@ from src.core.feature_engineering import add_additional_features
 from src.core.smoothing import generate_smoothed_dfs
 from src.knn.config import get_group_config, set_dynamic_overlay
 from src.storage.dynamic_config import load_dynamic_config_from_r2
+
+# Local cache dir used only by dry-run modes to keep event/border info on disk
+# between runs for faster turnaround. Separate from the refresh script's cache.
+DRY_RUN_CACHE_DIR = "local_cache/main"
+
+# Run modes
+MODE_PRODUCTION = "production"
+MODE_DRY_RUN = "dry_run"
+MODE_DRY_RUN_WITH_CACHE_REFRESH = "dry_run_with_cache_refresh"
+ALL_MODES = (MODE_PRODUCTION, MODE_DRY_RUN, MODE_DRY_RUN_WITH_CACHE_REFRESH)
 
 def filter_data_by_current_step(df: pd.DataFrame, current_step: int, norm_event_length: int, 
                                 event_start_time: str, event_end_time: str) -> pd.DataFrame:
@@ -218,8 +229,22 @@ def get_current_step(norm_event_length: int, metadata: Dict[str, Any], df: pd.Da
     logging.debug(f"Current step: {current_step}")
     return current_step
 
-def main():
-    logging.info("Starting border prediction pipeline...")
+def main(mode: str = MODE_PRODUCTION) -> Optional[Dict]:
+    if mode not in ALL_MODES:
+        raise ValueError(f"Unknown mode: {mode}. Expected one of {ALL_MODES}")
+    is_dry_run = mode in (MODE_DRY_RUN, MODE_DRY_RUN_WITH_CACHE_REFRESH)
+
+    logging.info(f"Starting border prediction pipeline... (mode={mode})")
+
+    # Wipe the dry-run cache up-front if requested, so the next load will
+    # re-download fresh event/border data from R2.
+    if mode == MODE_DRY_RUN_WITH_CACHE_REFRESH:
+        import shutil
+        from pathlib import Path
+        cache_path = Path(DRY_RUN_CACHE_DIR)
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+            logging.info(f"Removed {cache_path} (cache-refresh mode)")
 
     r2_client = R2Client()
 
@@ -248,11 +273,12 @@ def main():
             'StartAt': "2025-08-31T15:00:00+09:00",
             'EndAt': "2025-09-08T20:59:59+09:00",
         }
-    
-    if not testing and should_skip_prediction(metadata) :
+
+    # Dry-run bypasses the timing gate so you can run outside the active window.
+    if not testing and not is_dry_run and should_skip_prediction(metadata):
         logging.info("Prediction skipped due to timing constraints.")
-        return
-    
+        return None
+
     target = 'anniversary' if metadata['EventType'] == 5 else 'normal'
     logging.info(f"Event type: {target}")
 
@@ -262,8 +288,7 @@ def main():
     idol_ids = list(range(1, 53)) if target == 'anniversary' else [0]
     logging.info(f"Using borders: {borders}")
 
-    # Determine min_event_id. Prefer per-(event_type, sub_type, border) value
-    # from GroupConfig; fall back to internal-event-type-based default.
+    # Determine min_event_id per-group from the dynamic overlay.
     sub_event_types = get_sub_event_types(
         event_id=metadata['EventId'],
         internal_event_type=metadata['InternalEventType'],
@@ -276,20 +301,27 @@ def main():
     )
     logging.info(f"Using min event id: {min_event_id}")
 
-    # Load data and calculate parameters
-    df, eid_to_len_boost_ratio, event_name_map = load_all_data(r2_client,
-                                                               metadata,
-                                                               target,
-                                                               idol_ids,
-                                                               min_event_id,
-                                                               use_local_cache=True if testing else False)
+    # Dry-run modes cache event/border data under ``local_cache/main`` for
+    # faster subsequent runs. testing mode uses the default ``./data_cache``.
+    use_local_cache = testing or is_dry_run
+    local_cache_dir = DRY_RUN_CACHE_DIR if is_dry_run else "./data_cache"
+
+    df, eid_to_len_boost_ratio, event_name_map = load_all_data(
+        r2_client,
+        metadata,
+        target,
+        idol_ids,
+        min_event_id,
+        use_local_cache=use_local_cache,
+        local_cache_dir=local_cache_dir,
+    )
     standard_event_length, standard_event_boost_ratio = calculate_standard_event_length_boost_ratio(df, metadata, eid_to_len_boost_ratio)
-    
+
     current_step = get_current_step(norm_event_length, metadata, df)
     # For testing - filter data based on current step
     if testing:
         current_step = 250
-        df = filter_data_by_current_step(df, current_step, norm_event_length, 
+        df = filter_data_by_current_step(df, current_step, norm_event_length,
                                         metadata['StartAt'], metadata['EndAt'])
     logging.info(f"Current step: {current_step}/{norm_event_length}")
 
@@ -301,8 +333,13 @@ def main():
         if testing:
             save_predictions_to_local_debug(r2_client, results, metadata['EventId'])
         else:
-            upload_predictions_to_r2(r2_client, results, metadata['EventId'], current_step=current_step)
-        logging.info(f"Prediction completed and uploaded for event ID: {metadata['EventId']}")
+            upload_predictions_to_r2(
+                r2_client, results, metadata['EventId'],
+                current_step=current_step,
+                dry_run=is_dry_run,
+            )
+        where = "dry_run/ prefix" if is_dry_run else "production path"
+        logging.info(f"Prediction completed and uploaded to {where} for event ID: {metadata['EventId']}")
     else:
         logging.warning("No results to upload")
 
@@ -385,4 +422,21 @@ def get_sub_event_types(event_id: int, internal_event_type: int, event_type: flo
         return (1.0,)
 
 if __name__ == "__main__":
-    main()
+    cli = argparse.ArgumentParser(description="Run the KNN prediction pipeline.")
+    cli.add_argument(
+        "--mode",
+        choices=ALL_MODES,
+        default=MODE_PRODUCTION,
+        help=(
+            f"{MODE_PRODUCTION}: upload to prod path. "
+            f"{MODE_DRY_RUN}: upload to dry_run/ prefix, cache event/border "
+            f"data at {DRY_RUN_CACHE_DIR}/, bypass timing gate. "
+            f"{MODE_DRY_RUN_WITH_CACHE_REFRESH}: same as {MODE_DRY_RUN} but "
+            f"wipes the cache first to force a fresh R2 pull."
+        ),
+    )
+    cli.add_argument("--log-level", default="INFO")
+    args = cli.parse_args()
+
+    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
+    main(mode=args.mode)

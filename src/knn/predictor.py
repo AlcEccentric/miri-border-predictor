@@ -168,6 +168,7 @@ def predict_curve_knn(
             method_weights=stage.method_weights,
             scale_cap=stage.scale_cap,
             disable_scale=config.disable_scale,
+            neighbor_ids=neighbor_ids,
         )
     else:
         prediction = single_method_predict(
@@ -180,6 +181,7 @@ def predict_curve_knn(
             align_lookback=stage.align_lookback,
             scale_cap=stage.scale_cap,
             disable_scale=config.disable_scale,
+            neighbor_ids=neighbor_ids,
         )
 
     if is_debug_logging():
