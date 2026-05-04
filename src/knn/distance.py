@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 
-from knn_config import DistanceMetric, get_group_config
+from src.knn.config import DistanceMetric, get_group_config
 
 NeighbourId = Tuple[float, float]  # (event_id, idol_id)
 

@@ -11,7 +11,7 @@ import sys
 import glob
 from pathlib import Path
 
-def analyze_confidence_intervals_for_group(df_group, confidence_levels=[50, 75, 90]):
+def analyze_confidence_intervals_for_group(df_group, confidence_levels=[75, 90]):
     """
     Analyze confidence intervals of relative errors for each step across all events.
     
@@ -91,7 +91,7 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze confidence intervals of relative errors for all CSV files')
     parser.add_argument('--input-dir', default='test_results', help='Directory containing CSV files (default: test_results)')
     parser.add_argument('--output-dir', default='confidence_intervals', help='Output directory (default: confidence_intervals)')
-    parser.add_argument('--confidence-levels', nargs='+', type=int, default=[50, 75, 90], help='Confidence levels to calculate (default: 50 75 90)')
+    parser.add_argument('--confidence-levels', nargs='+', type=int, default=[75, 90], help='Confidence levels to calculate (default: 75 90)')
     parser.add_argument('--start-step', type=int, default=55, help='Starting step (default: 55)')
     parser.add_argument('--end-step', type=int, default=299, help='Ending step (default: 299)')
     

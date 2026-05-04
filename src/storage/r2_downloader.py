@@ -9,7 +9,7 @@ import os
 import logging
 from pathlib import Path
 from typing import Optional
-from r2_client import R2Client
+from src.storage.r2_client import R2Client
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

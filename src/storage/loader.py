@@ -5,9 +5,9 @@ import logging
 from typing import Tuple, List, Optional, Dict, Any
 import boto3
 from io import StringIO
-from data_processing import combine_info, process_data
-from interpolation import interpolate
-from r2_client import R2Client
+from src.core.data_processing import combine_info, process_data
+from src.core.interpolation import interpolate
+from src.storage.r2_client import R2Client
 
 BUCKET_NAME = 'mltd-border-predict'
 
@@ -497,3 +497,32 @@ def get_len_and_boost_ratio(event_info: pd.DataFrame, idol_ids: List[int]) -> Di
                     'boost_start': boost_start,
                 }
     return eid_to_len_boost_ratio
+
+
+def load_ci_csv_from_r2(
+    r2_client: R2Client,
+    event_type: float,
+    sub_type: float,
+    border: float,
+) -> pd.DataFrame:
+    """Fetch ``ci/latest/confidence_intervals_{et}_{sub}_{border}.csv`` from R2."""
+    from src.storage.dynamic_config import r2_ci_latest_key
+    key = r2_ci_latest_key(event_type, sub_type, border)
+    logging.info(f"Loading CI from r2://{BUCKET_NAME}/{key}")
+    obj = r2_client.get_object(BUCKET_NAME, key)
+    return pd.read_csv(StringIO(obj["Body"].read().decode("utf-8")))
+
+
+def upload_ci_csv_to_r2(
+    r2_client: R2Client,
+    key: str,
+    df: pd.DataFrame,
+) -> None:
+    body = df.to_csv(index=False).encode("utf-8")
+    r2_client.put_object(
+        bucket_name=BUCKET_NAME,
+        key=key,
+        body=body,
+        ContentType="text/csv",
+    )
+    logging.info(f"Wrote CI CSV to r2://{BUCKET_NAME}/{key} ({len(body)} bytes)")
