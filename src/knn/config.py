@@ -65,7 +65,10 @@ class GroupConfig:
     # D = (1 - slope_weight) * D_level + slope_weight * D_slope
     # Each component is an RMSE divided by a scale derived from the current
     # window's own magnitude / mean |slope|.
-    slope_weight: float = 0.5
+    # Stage-specific so you can blend differently in early vs. mid vs. late.
+    early_stage_slope_weight: float = 0.5
+    mid_stage_slope_weight: float = 0.5
+    late_stage_slope_weight: float = 0.5
 
 
     early_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
@@ -191,7 +194,9 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_metric=DistanceMetric.SLOPE_AWARE,
         mid_stage_metric=DistanceMetric.SLOPE_AWARE,
         late_stage_metric=DistanceMetric.SLOPE_AWARE,
-        slope_weight=0.6,
+        early_stage_slope_weight=0.6,
+        mid_stage_slope_weight=0.6,
+        late_stage_slope_weight=0.6,
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
@@ -413,7 +418,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_metric=DistanceMetric.SLOPE_AWARE,
         early_stage_scale_cap=(0.65, 1.35),
         mid_stage_scale_cap=(0.8, 1.2),
-        late_stage_scale_cap=(0.8, 1.2),  
+        late_stage_scale_cap=(0.8, 1.2),
         early_stage_weights={
             AlignmentMethod.AFFINE: 0.7,
             AlignmentMethod.LINEAR: 0.2,
@@ -472,7 +477,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     # For Tale
     configs[(13.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=100,
-        mid_stage_end=195,
+        mid_stage_end=165,
         early_stage_k=5,
         mid_stage_k=4,
         late_stage_k=4,
@@ -483,9 +488,15 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_lookback_for_align=60,
         mid_stage_lookback_for_align=55,
         late_stage_lookback_for_align=25, 
-        early_stage_metric=DistanceMetric.RMSE,
+        early_stage_scale_cap=(0.7, 1.3),
+        mid_stage_scale_cap=(0.75, 1.25),
+        late_stage_scale_cap=(0.8, 1.2),
+        early_stage_metric=DistanceMetric.FINAL_DIFF,
         mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
+        early_stage_slope_weight=0.6,
+        mid_stage_slope_weight=0.6,
+        late_stage_slope_weight=0.6,
         early_stage_use_ensemble=False,
         mid_stage_use_ensemble=False,
         late_stage_use_ensemble=False,
@@ -501,21 +512,24 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_end=115,
         mid_stage_end=200,
         early_stage_k=5,
-        mid_stage_k=2,
+        mid_stage_k=3,
         late_stage_k=3,
         disable_scale=False,
-        early_stage_scale_cap=(0.9, 1.1),
-        mid_stage_scale_cap=(0.9, 1.1),
-        late_stage_scale_cap=(0.9, 1.1),
+        early_stage_scale_cap=(0.8, 1.2),
+        mid_stage_scale_cap=(0.75, 1.25),
+        late_stage_scale_cap=(0.8, 1.2),
         early_stage_lookback=50,
         mid_stage_lookback=50,
         late_stage_lookback=25,
         early_stage_lookback_for_align=50,
         mid_stage_lookback_for_align=25,
         late_stage_lookback_for_align=25, 
-        early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.FINAL_DIFF,
-        late_stage_metric=DistanceMetric.FINAL_DIFF,
+        early_stage_metric=DistanceMetric.SLOPE_AWARE,
+        mid_stage_metric=DistanceMetric.SLOPE_AWARE,
+        late_stage_metric=DistanceMetric.SLOPE_AWARE,
+        early_stage_slope_weight=0.75,
+        mid_stage_slope_weight=0.4,
+        late_stage_slope_weight=0.4,
         early_stage_use_ensemble=False,
         mid_stage_use_ensemble=False,
         late_stage_use_ensemble=False,

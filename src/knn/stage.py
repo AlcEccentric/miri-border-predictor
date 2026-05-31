@@ -36,6 +36,7 @@ class StageParams:
     use_smooth_for_neighbors: bool
     use_smooth_for_prediction: bool
     scale_cap: Tuple[float, float]
+    slope_weight: float
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -57,6 +58,7 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         use_smooth_for_neighbors=getattr(config, f"{stage}_stage_use_smooth_for_neighbors"),
         use_smooth_for_prediction=getattr(config, f"{stage}_stage_use_smooth_for_prediction"),
         scale_cap=getattr(config, f"{stage}_stage_scale_cap"),
+        slope_weight=getattr(config, f"{stage}_stage_slope_weight"),
     )
 
 
