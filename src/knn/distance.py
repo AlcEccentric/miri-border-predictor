@@ -53,7 +53,7 @@ def _dtw_distance(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
 def _slope_aware_distance(
     current_window: np.ndarray,
     candidate_window: np.ndarray,
-    config,
+    slope_weight: float,
 ) -> float:
     """Distance blending level and slope RMSEs.
 
@@ -68,7 +68,7 @@ def _slope_aware_distance(
     if L < 2:
         return float(np.sqrt(np.mean((current_window - candidate_window) ** 2)))
 
-    a_slope = float(config.slope_weight)
+    a_slope = float(slope_weight)
     a_level = max(0.0, 1.0 - a_slope)
 
     eps = 1e-9
@@ -94,6 +94,7 @@ def trajectory_distance(
     event_type: float,
     sub_types: Tuple[float],
     border: float,
+    slope_weight: float,
 ) -> float:
     """Distance between the last ``lookback`` points of the two trajectories.
 
@@ -118,7 +119,7 @@ def trajectory_distance(
     if metric == DistanceMetric.RMSE:
         return float(np.sqrt(np.mean((current_window - candidate_window) ** 2)))
     if metric == DistanceMetric.SLOPE_AWARE:
-        return _slope_aware_distance(current_window, candidate_window, config)
+        return _slope_aware_distance(current_window, candidate_window, slope_weight)
     # FINAL_DIFF: mean absolute difference in the lookback window
     return float(np.mean(np.abs(current_window - candidate_window)))
 
@@ -163,6 +164,7 @@ def find_nearest_neighbors(
     event_type: float,
     sub_types: Tuple[float],
     border: float,
+    slope_weight: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return the top-k nearest neighbours and their distances.
 
@@ -178,7 +180,7 @@ def find_nearest_neighbors(
             continue
         distances.append(trajectory_distance(
             current_partial, candidate, lookback, metric,
-            event_type, sub_types, border,
+            event_type, sub_types, border, slope_weight,
         ))
         kept_indices.append(idx)
 

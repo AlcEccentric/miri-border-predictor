@@ -138,6 +138,7 @@ def predict_curve_knn(
         event_type=event_type,
         sub_types=sub_types,
         border=border,
+        slope_weight=stage.slope_weight,
     )
 
     if is_debug_logging():
