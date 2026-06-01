@@ -478,7 +478,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     configs[(13.0, (1.0,), 100.0)] = GroupConfig(
         early_stage_end=100,
         mid_stage_end=165,
-        early_stage_k=5,
+        early_stage_k=4,
         mid_stage_k=4,
         late_stage_k=4,
         disable_scale=False,
@@ -497,7 +497,12 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_slope_weight=0.6,
         mid_stage_slope_weight=0.6,
         late_stage_slope_weight=0.6,
-        early_stage_use_ensemble=False,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.8,
+            AlignmentMethod.LINEAR: 0.1,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
         mid_stage_use_ensemble=False,
         late_stage_use_ensemble=False,
         early_stage_use_smooth_for_neighbors=False,
