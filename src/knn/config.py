@@ -516,7 +516,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_k=3,
         disable_scale=False,
         early_stage_scale_cap=(0.8, 1.2),
-        mid_stage_scale_cap=(0.75, 1.25),
+        mid_stage_scale_cap=(0.8, 1.2),
         late_stage_scale_cap=(0.8, 1.2),
         early_stage_lookback=50,
         mid_stage_lookback=50,
