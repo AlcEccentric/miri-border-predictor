@@ -532,10 +532,15 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_metric=DistanceMetric.SLOPE_AWARE,
         mid_stage_metric=DistanceMetric.SLOPE_AWARE,
         late_stage_metric=DistanceMetric.SLOPE_AWARE,
-        early_stage_slope_weight=0.75,
+        early_stage_slope_weight=0.7,
         mid_stage_slope_weight=0.4,
         late_stage_slope_weight=0.4,
-        early_stage_use_ensemble=False,
+        early_stage_weights={
+            AlignmentMethod.AFFINE: 0.1,
+            AlignmentMethod.LINEAR: 0.8,
+            AlignmentMethod.RATIO: 0.1
+        },
+        early_stage_use_ensemble=True,
         mid_stage_use_ensemble=False,
         late_stage_use_ensemble=False,
         early_stage_use_smooth_for_neighbors=False,
