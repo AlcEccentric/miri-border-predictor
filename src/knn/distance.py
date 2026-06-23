@@ -133,12 +133,18 @@ def build_candidate_set(
     exclude_event_id: float,
     current_step: int,
     min_event_id: float,
+    min_score_at_step: float = 0.0,
 ) -> Tuple[List[np.ndarray], List[NeighbourId]]:
     """Collect historical (event, idol) trajectories eligible as neighbours.
 
     A trajectory is eligible if it is not from the current event, its
-    event_id is at least ``min_event_id``, and its length is at least
-    ``current_step``.
+    event_id is at least ``min_event_id``, its length is at least
+    ``current_step``, and (when ``min_score_at_step`` > 0) its score at the
+    prediction step is at least ``min_score_at_step``.
+
+    The score gate mirrors the target-side ``MIN_CURRENT_SCORE`` check so
+    "not yet started" candidates (flat-zero in the lookback window, which
+    arbitrarily match low-magnitude targets by shape) don't enter the pool.
     """
     historical = search_df[search_df["event_id"] != exclude_event_id]
     trajectories: List[np.ndarray] = []
@@ -147,9 +153,12 @@ def build_candidate_set(
         if eid < min_event_id:
             continue
         scores = group["score"].values
-        if len(scores) >= current_step:
-            trajectories.append(scores)
-            ids.append((eid, iid))
+        if len(scores) < current_step:
+            continue
+        if min_score_at_step > 0 and scores[current_step - 1] < min_score_at_step:
+            continue
+        trajectories.append(scores)
+        ids.append((eid, iid))
     return trajectories, ids
 
 

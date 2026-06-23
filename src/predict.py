@@ -148,6 +148,7 @@ def load_confidence_intervals(
     sub_type: float,
     border: float,
     step: int,
+    tier: int = 0,
     r2_client=None,
 ) -> Dict[int, Tuple[float, float]]:
     """Load confidence intervals for given parameters from R2.
@@ -155,6 +156,11 @@ def load_confidence_intervals(
     The per-(event_type, sub_type, border) CSV is fetched once per process
     and cached in ``_CI_CACHE``. If R2 access is unavailable and the caller
     did not supply a client, raises (no local-disk fallback by design).
+
+    ``tier`` defaults to ``0`` for non-anniversary CIs (single CI per step).
+    For anniversary (type 5) CIs, callers should pass the target idol's
+    quartile (1..4) computed from the current event's smoothed score
+    ranking at the prediction step.
     """
     from src.storage.loader import load_ci_csv_from_r2
     from src.storage.r2_client import R2Client
@@ -165,21 +171,41 @@ def load_confidence_intervals(
         _CI_CACHE[cache_key] = load_ci_csv_from_r2(client, event_type, sub_type, border)
     df = _CI_CACHE[cache_key]
 
-    step_data = df[df['step'] == step]
+    has_tier = 'tier' in df.columns
+
+    if has_tier:
+        # Filter by both step and tier; fall back to tier=0 if requested tier
+        # has no rows (e.g. legacy CSV that only has tier=0).
+        step_data = df[(df['step'] == step) & (df['tier'] == tier)]
+        if step_data.empty and (df['tier'] == tier).sum() == 0:
+            step_data = df[(df['step'] == step) & (df['tier'] == 0)]
+    else:
+        step_data = df[df['step'] == step]
 
     # If exact step not found, find closest step within 25 steps
     if step_data.empty:
-        available_steps = df['step'].unique()
+        if has_tier:
+            tier_subset = df[df['tier'] == tier]
+            if tier_subset.empty:
+                tier_subset = df[df['tier'] == 0]
+            available_steps = tier_subset['step'].unique()
+        else:
+            available_steps = df['step'].unique()
         closest_step = min(available_steps, key=lambda x: abs(x - step))
 
         if abs(closest_step - step) > 25:
             raise ValueError(
                 f"No confidence interval data found within 25 steps of step {step} "
-                f"for (event_type={event_type}, sub_type={sub_type}, border={border}). "
+                f"for (event_type={event_type}, sub_type={sub_type}, border={border}, tier={tier}). "
                 f"Closest available step: {closest_step}"
             )
 
-        step_data = df[df['step'] == closest_step]
+        if has_tier:
+            step_data = df[(df['step'] == closest_step) & (df['tier'] == tier)]
+            if step_data.empty:
+                step_data = df[(df['step'] == closest_step) & (df['tier'] == 0)]
+        else:
+            step_data = df[df['step'] == closest_step]
         logging.info(f"Using closest step {closest_step} for requested step {step}")
 
     intervals_map = {}
@@ -191,13 +217,14 @@ def load_confidence_intervals(
     if missing_levels:
         raise ValueError(
             f"Missing required confidence levels {sorted(missing_levels)} for step {step} "
-            f"(event_type={event_type}, sub_type={sub_type}, border={border})"
+            f"(event_type={event_type}, sub_type={sub_type}, border={border}, tier={tier})"
         )
 
     return intervals_map
 
 def build_result_dict(
     event_id: int,
+    event_type: float,
     idol_id: int,
     border: float,
     current_step: int,
@@ -452,7 +479,19 @@ def build_result_dict(
             if result["data"]["normalized"]["neighbors"][neighbor_key]:
                 first_neighbor = result["data"]["normalized"]["neighbors"][neighbor_key][0]
                 result["data"]["normalized"]["neighbors"][neighbor_key] = [x - first_neighbor for x in result["data"]["normalized"]["neighbors"][neighbor_key]]
-    
+
+    # For type 5 anniversary events, the per-step CI bound trajectories balloon
+    # the JSON payload (52 idols x 2 borders x 2 levels x 300 steps). Frontends
+    # only need the final value of each bound, so collapse to last-value-only
+    # after all zero-baseline shifts have been applied.
+    if event_type == 5:
+        for confidence_level in result["data"]["raw"]["bounds"]:
+            bounds = result["data"]["raw"]["bounds"][confidence_level]
+            result["data"]["raw"]["bounds"][confidence_level] = {
+                "upper_final": bounds["upper"][-1],
+                "lower_final": bounds["lower"][-1],
+            }
+
     # Final consistency check: compare normalized and denormalized final values
     norm_final = normalized_target[-1]
     raw_final = raw_target[-1]
@@ -488,6 +527,45 @@ def build_result_dict(
 
     return result
 
+def _compute_tier_by_idol_border(
+    data: Dict[str, pd.DataFrame],
+    event_id: int,
+    event_type: float,
+    sub_type: float,
+    borders: List[float],
+    n_tiers: int = 4,
+) -> Dict[Tuple[int, float], int]:
+    """Per-(idol, border) quartile tier for type 5 anniversary events.
+
+    Returns ``{}`` for non-anniversary types. For type 5: rank the event's
+    52 idols by their smoothed score at the latest known step (last value
+    of the smoothed partial trajectory). Tier 1 = bottom quartile, tier 4
+    = top quartile. Same idol can land in different tiers across events.
+    """
+    if event_type != 5:
+        return {}
+    sub_types = (sub_type,)
+    out: Dict[Tuple[int, float], int] = {}
+    for border in borders:
+        filtered = get_filtered_df(data['smooth_part'], event_type, border, list(sub_types))
+        cur = filtered[filtered['event_id'] == event_id]
+        if cur.empty:
+            continue
+        per_idol_score = (
+            cur.sort_values('aggregated_at')
+               .groupby('idol_id')['score']
+               .last()
+        )
+        ranks = per_idol_score.rank(method='first')
+        n = len(ranks)
+        if n == 0:
+            continue
+        for iid, r in ranks.items():
+            tier = max(1, min(n_tiers, int(np.ceil(r / n * n_tiers))))
+            out[(int(iid), float(border))] = tier
+    return out
+
+
 def get_predictions(
     data: Dict[str, pd.DataFrame],
     event_id: int,
@@ -506,6 +584,13 @@ def get_predictions(
 ) -> Dict:
     results = {}
     sub_types = (sub_type,)
+
+    # Pre-compute per-(idol, border) tier for type 5 anniversary events.
+    # Empty dict for other event types -> tier=0 used everywhere downstream.
+    tier_by_idol_border = _compute_tier_by_idol_border(
+        data=data, event_id=event_id, event_type=event_type,
+        sub_type=sub_type, borders=borders,
+    )
 
     for idol_id in idol_ids:
         if idol_id not in results:
@@ -548,10 +633,15 @@ def get_predictions(
                 current_raw_data = np.array(current_raw_data)
                 current_norm_data = np.array(current_norm_data)
 
-                confidence_intervals = load_confidence_intervals(event_type, sub_type, border, step, r2_client=r2_client)
+                confidence_intervals = load_confidence_intervals(
+                    event_type, sub_type, border, step,
+                    tier=tier_by_idol_border.get((int(idol_id), float(border)), 0),
+                    r2_client=r2_client,
+                )
                 
                 result = build_result_dict(
                     event_id=event_id,
+                    event_type=event_type,
                     idol_id=idol_id,
                     border=border,
                     current_step=step,

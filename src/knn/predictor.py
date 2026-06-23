@@ -122,6 +122,13 @@ def predict_curve_knn(
         exclude_event_id=event_id,
         current_step=current_step,
         min_event_id=config.least_neighbor_id,
+        # Exclude only literally-unstarted candidates (score == 0 at the
+        # prediction step). Don't impose the target-side MIN_CURRENT_SCORE
+        # floor on neighbours — that would strip out small-magnitude
+        # candidates and force the pool to be much larger than the target,
+        # producing predictions inflated by ~1000x for type 5 low-popularity
+        # idols at small borders.
+        min_score_at_step=1.0,
     )
     if not candidate_partials:
         raise ValueError(f"No valid historical partial trajectories for step {current_step}")

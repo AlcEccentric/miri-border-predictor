@@ -70,7 +70,16 @@ def _fit_alignment(
         return raw_scale
 
     if method == AlignmentMethod.LINEAR:
-        raw_scale = (current_window[-1] - current_window[0]) / (neighbor_window[-1] - neighbor_window[0])
+        denom = neighbor_window[-1] - neighbor_window[0]
+        if denom == 0 or not np.isfinite(denom):
+            # Neighbor's window is flat — LINEAR's slope-based fit is degenerate.
+            # Fall back to identity (scale=1, offset=0) so the aligned curve
+            # stays finite and the blend doesn't get poisoned by NaN.
+            logging.debug(
+                f"[{method.value}] neighbor window flat (denom={denom}); falling back to identity"
+            )
+            return 1.0, 0.0
+        raw_scale = (current_window[-1] - current_window[0]) / denom
         scale = _clamped(float(raw_scale))
         # Anchor the first point.
         offset = current_window[0] - scale * neighbor_window[0]
@@ -91,7 +100,13 @@ def _fit_alignment(
 
     # RATIO: scale = mean(current) / mean(neighbor), clamped, then offset
     # chosen so the last scaled point matches the last current point.
-    raw_scale = float(np.mean(current_window) / np.mean(neighbor_window))
+    neighbor_mean = float(np.mean(neighbor_window))
+    if neighbor_mean == 0 or not np.isfinite(neighbor_mean):
+        logging.debug(
+            f"[{method.value}] neighbor window has zero/non-finite mean; falling back to identity"
+        )
+        return 1.0, 0.0
+    raw_scale = float(np.mean(current_window) / neighbor_mean)
     scale = _clamped(raw_scale)
     offset = float(current_window[-1] - scale * neighbor_window[-1])
     return scale, offset
@@ -130,7 +145,14 @@ def _neighbor_scale_cap(
     current_step: int,
     lookback: int,
 ) -> Tuple[float, float]:
-    """Range of (future growth) / (lookback growth) ratios across the neighbours."""
+    """Range of (future growth) / (lookback growth) ratios across the neighbours.
+
+    Returns ``(1.0, 1.0)`` when no neighbour has non-zero lookback growth (e.g.
+    early-step anniversary low-cutoff borders where small idols haven't
+    accumulated points yet). Neutral defaults so the caller's downstream
+    ``_cap_future_growth_ratio`` math doesn't crash; the cap is a no-op today
+    anyway.
+    """
     ratios: List[float] = []
     for full, partial in zip(neighbor_full_list, neighbor_partial_list):
         lookback_start = max(0, len(partial) - lookback)
@@ -138,6 +160,8 @@ def _neighbor_scale_cap(
         future_growth = full[-1] - full[current_step - 1]
         if lookback_growth != 0:
             ratios.append(future_growth / lookback_growth)
+    if not ratios:
+        return 1.0, 1.0
     return min(ratios), max(ratios)
 
 
