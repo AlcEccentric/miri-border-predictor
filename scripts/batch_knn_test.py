@@ -394,7 +394,13 @@ class BatchKNNTester:
             print("No results generated!")
     
     def save_md_summary(self, results: List[dict], output_md: str, dir: str):
-        """Save step-wise error summary to a Markdown file, including event IDs with error > 10% and their errors."""
+        """Save step-wise error summary to a Markdown file.
+
+        Outlier formatting depends on event type:
+        - Type 5 (52 idols per event): group outliers by event_id and show
+          ``event_id (N idols, low%..high%)`` so the cell stays readable.
+        - Other types (1 idol per event): show ``event_id(error%)`` as before.
+        """
         if dir:
             Path(dir).mkdir(parents=True, exist_ok=True)
             output_md = Path(dir) / output_md
@@ -405,10 +411,13 @@ class BatchKNNTester:
             print(f"Markdown summary saved to: {output_md}")
             return
 
+        is_anniversary = self.event_type == 5
+        outlier_label = "Outlier Events >10% Error" if is_anniversary else "Event IDs >10% Error"
+
         md_lines = [
             "# KNN Batch Test Summary\n",
-            "| Step | Avg Abs Rel Error (%) | Median Abs Rel Error (%) | Rel Error Range (%) | Coverage 5% | Coverage 10% | Event IDs >10% Error |",
-            "|------|----------------------|-------------------------|--------------------|-------------|--------------|----------------------|"
+            f"| Step | Avg Abs Rel Error (%) | Median Abs Rel Error (%) | Rel Error Range (%) | Coverage 5% | Coverage 10% | {outlier_label} |",
+            "|------|----------------------|-------------------------|--------------------|-------------|--------------|----------------------|",
         ]
         for step in sorted(df['step'].unique()):
             step_df = df[df['step'] == step]
@@ -419,17 +428,33 @@ class BatchKNNTester:
             rel_err_max = abs_rel_err.max()
             coverage_5 = (abs_rel_err <= 5).mean() * 100
             coverage_10 = (abs_rel_err <= 10).mean() * 100
-            # Get event IDs with error > 10% and their errors
-            event_ids_out = step_df.loc[abs_rel_err > 10, ['event_id', 'relative_error']]
-            if not event_ids_out.empty:
-                event_ids_str = ", ".join(
-                    f"{int(row['event_id'])}({row['relative_error']:.2f}%)"
-                    for _, row in event_ids_out.iterrows()
-                )
+
+            outliers = step_df.loc[abs_rel_err > 10, ['event_id', 'idol_id', 'relative_error']]
+            if outliers.empty:
+                outliers_str = "-"
+            elif is_anniversary:
+                # Group by event_id; show count of bad idols + error range.
+                # Sorted by max abs error so the worst events come first.
+                grouped = outliers.groupby('event_id')['relative_error'].agg(['count', 'min', 'max'])
+                grouped['_worst'] = grouped[['min', 'max']].abs().max(axis=1)
+                grouped = grouped.sort_values('_worst', ascending=False)
+                parts = [
+                    f"{int(eid)} ({int(row['count'])} idols, "
+                    f"{row['min']:+.2f}%..{row['max']:+.2f}%)"
+                    for eid, row in grouped.iterrows()
+                ]
+                outliers_str = ", ".join(parts)
             else:
-                event_ids_str = "-"
+                # Non-anniversary: one idol per event, list each pair sorted by |error|.
+                ordered = outliers.assign(_abs=outliers['relative_error'].abs())
+                ordered = ordered.sort_values('_abs', ascending=False)
+                outliers_str = ", ".join(
+                    f"{int(row['event_id'])}({row['relative_error']:.2f}%)"
+                    for _, row in ordered.iterrows()
+                )
+
             md_lines.append(
-                f"| {step} | {avg_abs_rel:.2f} | {median_abs_rel:.2f} | [{rel_err_min:.2f}, {rel_err_max:.2f}] | {coverage_5:.1f}% | {coverage_10:.1f}% | {event_ids_str} |"
+                f"| {step} | {avg_abs_rel:.2f} | {median_abs_rel:.2f} | [{rel_err_min:.2f}, {rel_err_max:.2f}] | {coverage_5:.1f}% | {coverage_10:.1f}% | {outliers_str} |"
             )
         with open(output_md, "w") as f:
             f.write("\n".join(md_lines))
@@ -486,12 +511,12 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 3.0,
-        'sub_event_types': [2.0],
+        'event_type': 5.0,
+        'sub_event_types': [1.0],
         'border': 100.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
+        'recent_count': 5,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
         'look_back_event_cnt': 225,  # include only the N most recent past events of this event_type as candidates
         'log_level': 'INFO'
     }

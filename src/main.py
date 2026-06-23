@@ -97,8 +97,10 @@ def calculate_standard_event_length_boost_ratio(df, metadata, eid_to_len_ratio):
         
         logging.info(f"Standard event length (most frequent): {standard_event_length}")
         logging.debug(f"Length distribution: {dict(length_counts.head())}")
-        
-        return standard_event_length, 0.55
+
+        # Type-5 events run 13 days with the boost (折り返し) starting on day 6,
+        # so pre-boost / total = 6/13 ≈ 0.4615. Previously hardcoded as 0.55.
+        return standard_event_length, 6.0 / 13.0
     else:
         logging.info("Event type not 5. Deeming current event as standard.")
         cur_idol_id = 0

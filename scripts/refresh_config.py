@@ -145,13 +145,31 @@ def ensure_local_cache(
         event_info_local.write_bytes(obj["Body"].read())
 
     event_info = pd.read_csv(event_info_local)
-    event_ids_needed = set(event_info["event_id"].astype(int).tolist())
     borders_needed = {int(b) for (_et, _sub, b) in groups}
-    idol_ids_needed = {0}  # extend to range(1,53) if anniversary groups get added
 
-    # Border files: one call per missing file. That's the same pattern r2_downloader.py uses.
-    for eid in event_ids_needed:
-        for iid in idol_ids_needed:
+    # Idol-id sets per event-type family:
+    #   type 5 (anniversary) -> idols 1..52
+    #   everything else      -> idol 0
+    # Iterate per-event so we never hit R2 for a (eid, iid) combo we know
+    # doesn't exist (e.g. asking for idol 5 of a type-3 event).
+    need_anniversary = any(et == 5.0 for (et, _sub, _border) in groups)
+    need_normal = any(et != 5.0 for (et, _sub, _border) in groups)
+    event_type_by_id = dict(zip(
+        event_info["event_id"].astype(int),
+        event_info["event_type"].astype(float),
+    ))
+
+    for eid, et in event_type_by_id.items():
+        if et == 5.0:
+            if not need_anniversary:
+                continue
+            iids = range(1, 53)
+        else:
+            if not need_normal:
+                continue
+            iids = (0,)
+
+        for iid in iids:
             for border in borders_needed:
                 name = f"border_info_{eid}_{iid}_{border}.csv"
                 local_path = LOCAL_BORDER_INFO_DIR / name
@@ -162,7 +180,7 @@ def ensure_local_cache(
                     local_path.write_bytes(obj["Body"].read())
                     logging.debug(f"cached {name}")
                 except Exception:
-                    # Many (eid, iid, border) combos don't exist; that's fine.
+                    # Some combos (eid, iid, border) genuinely don't exist; skip.
                     pass
 
 

@@ -361,6 +361,7 @@ def load_anniversary_data_from_r2(
     r2_client: R2Client,
     idol_ids: List[int] = list(range(1, 53)),
     borders: List[int] = [100, 1000],
+    min_event_id: int = 192,
     use_local_cache: bool = False,
     local_cache_dir: str = './data_cache'
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -392,7 +393,7 @@ def load_anniversary_data_from_r2(
     valid_event_info = event_info[valid_mask]
     
     valid_event_ids = set(valid_event_info['event_id'].unique())
-    filtered_event_ids = [eid for eid in event_ids if eid in valid_event_ids and eid >= 192] # exclude early anniversary data
+    filtered_event_ids = [eid for eid in event_ids if eid in valid_event_ids and eid >= min_event_id]
     
     logging.info(f"Loading data from R2 for {len(filtered_event_ids)} events (filtered from {len(event_ids)} requested)")
     
@@ -473,6 +474,7 @@ def load_all_data(r2_client: R2Client,
         logging.info("Loading anniversary data from R2...")
         b_info, e_info = load_anniversary_data_from_r2(
             r2_client,
+            min_event_id=min_event_id,
             use_local_cache=use_local_cache,
             local_cache_dir=local_cache_dir,
         )
