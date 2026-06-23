@@ -155,12 +155,15 @@ def do_normalize(df,
                 actual_boost_start=actual_boost_start,
             )
         else:
-            # Event type 5 always has consistent boost ratio
+            # Event type 5 always has consistent boost ratio (~0.55).
+            # The caller already passes ``standard_event_boost_ratio``; reuse
+            # it so the call signature is uniform across event types.
             normalized_data = normalize_consistently(
                 df=event_data,
                 full_norm_length=norm_event_length,
                 step=step,
                 standard_event_length=standard_event_length,
+                standard_event_boost_ratio=standard_event_boost_ratio,
                 full_event_length=full_event_len,
             )
         normalized_events.append(normalized_data)
