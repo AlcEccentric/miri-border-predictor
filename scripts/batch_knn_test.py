@@ -7,7 +7,7 @@ Allows testing KNN predictions on multiple events and steps with flexible event 
 import logging
 import pandas as pd
 import numpy as np
-from typing import List, Tuple, Optional, Union, Dict, Any
+from typing import List, Tuple, Optional, Union, Dict
 from pathlib import Path
 import sys
 from datetime import datetime
@@ -258,6 +258,39 @@ class BatchKNNTester:
             final_scores[event_id] = event_final_scores
         
         return final_scores
+
+    @staticmethod
+    def _compute_tier_by_idol(
+        snf_pdf: pd.DataFrame,
+        event_id: float,
+        n_tiers: int = 4,
+    ) -> Dict[int, int]:
+        """Per-idol tier (1..n_tiers) from smoothed score ranking at the prediction step.
+
+        Tier 1 = bottom quartile (least popular at this point in this event),
+        Tier n_tiers = top quartile. Computed from the smoothed partial
+        dataframe so a single noisy step doesn't flip an idol's tier.
+        Event-and-step specific: an idol can be tier 1 in one event and
+        tier 4 in another.
+        """
+        cur = snf_pdf[snf_pdf['event_id'] == event_id]
+        if cur.empty:
+            return {}
+        per_idol_score = (
+            cur.sort_values('aggregated_at')
+               .groupby('idol_id')['score']
+               .last()
+        )
+        ranks = per_idol_score.rank(method='first')
+        n = len(ranks)
+        if n == 0:
+            return {}
+
+        def _to_tier(rank: float) -> int:
+            t = int(np.ceil(rank / n * n_tiers))
+            return max(1, min(n_tiers, t))
+
+        return {int(iid): _to_tier(r) for iid, r in ranks.items()}
     
     def run_predictions(self, 
                        test_event_ids: List[float],
@@ -266,7 +299,7 @@ class BatchKNNTester:
                        raw_data: pd.DataFrame,
                        length_to_df_data: Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]],
                        eid_to_len_boost_ratio: Dict) -> List[dict]:
-        results = []
+        results: List[dict] = []
         total_combinations = len(test_event_ids) * len(test_steps)
         current_combination = 0
         
@@ -285,6 +318,14 @@ class BatchKNNTester:
                 try:
                     # Generate smoothed data
                     smoo_df, snf_pdf = generate_smoothed_dfs(norm_df, nf_pdf)
+
+                    # For type 5 anniversary events, compute per-idol tier (1..4) from
+                    # the smoothed score ranking at the prediction step. Tier is
+                    # event-and-step-specific: same idol can land in different tiers
+                    # across events, which is what we want.
+                    tier_by_idol = self._compute_tier_by_idol(
+                        snf_pdf=snf_pdf, event_id=event_id,
+                    ) if self.event_type == 5 else {}
                     
                     # Get final scores from the original data
                     final_scores = {}
@@ -337,7 +378,6 @@ class BatchKNNTester:
                                 predicted_final = prediction[-1]
                             else:
                                 predicted_final = np.nan
-                            print(predicted_final)
                             
                             # Store result
                             result = {
@@ -345,6 +385,7 @@ class BatchKNNTester:
                                 'idol_id': idol_id,
                                 'border': self.border,
                                 'step': step,
+                                'tier': tier_by_idol.get(idol_id, 0),
                                 'prediction': predicted_final,
                                 'actual': actual_final,
                                 'relative_error': ((predicted_final - actual_final) / actual_final * 100) if actual_final != 0 else np.nan,
@@ -364,7 +405,7 @@ class BatchKNNTester:
                     raise e
         
         return results
-    
+
     def save_results(self, results: List[dict], output_file: str, dir: str = None):
         """Save results to CSV file."""
         if dir:
@@ -513,10 +554,10 @@ def main():
     CONFIG = {
         'event_type': 5.0,
         'sub_event_types': [1.0],
-        'border': 100.0,
+        'border': 1000.0,
         'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': 5,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
+        'recent_count': 4,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
         'look_back_event_cnt': 225,  # include only the N most recent past events of this event_type as candidates
         'log_level': 'INFO'
     }

@@ -226,24 +226,33 @@ def run_batch_knn_for_group(
 
 
 def build_ci_from_results(results_df: pd.DataFrame) -> pd.DataFrame:
-    """Run the percentile + step-interpolation step over batch results."""
+    """Run the percentile + step-interpolation step over batch results.
+
+    For results without a ``tier`` column, this emits a single row per
+    ``(step, confidence_level)`` (with ``tier=0``). For type 5 results,
+    tiers 1..4 are emitted per step.
+    """
     step_intervals = analyze_confidence_intervals_for_group(results_df, DEFAULT_CONFIDENCE_LEVELS)
     if not step_intervals:
         return pd.DataFrame()
     interpolated = interpolate_confidence_intervals(
         step_intervals, DEFAULT_CONFIDENCE_LEVELS, DEFAULT_START_STEP, DEFAULT_END_STEP,
     )
+    tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
     out_rows = []
     for step in range(DEFAULT_START_STEP, DEFAULT_END_STEP + 1):
-        for cl in DEFAULT_CONFIDENCE_LEVELS:
-            if (step, cl) in interpolated:
-                lower, upper = interpolated[(step, cl)]
-                out_rows.append({
-                    "step": step,
-                    "confidence_level": cl,
-                    "rel_error_lower_bound": lower,
-                    "rel_error_upper_bound": upper,
-                })
+        for tier in tiers:
+            for cl in DEFAULT_CONFIDENCE_LEVELS:
+                key = (step, tier, cl)
+                if key in interpolated:
+                    lower, upper = interpolated[key]
+                    out_rows.append({
+                        "step": step,
+                        "tier": tier,
+                        "confidence_level": cl,
+                        "rel_error_lower_bound": lower,
+                        "rel_error_upper_bound": upper,
+                    })
     return pd.DataFrame(out_rows)
 
 
@@ -323,13 +332,24 @@ def diff_ci_csvs(old_df: pd.DataFrame, new_df: pd.DataFrame, label: str) -> str:
     if new_df.empty:
         return f"## {label}: new file is empty\n\n"
 
+    # Backward compat: pre-tier CSVs lack a 'tier' column. Treat as tier=0
+    # so the merge key matches new_df rows that also use tier=0 for non-type-5.
+    old_df = old_df.copy()
+    new_df = new_df.copy()
+    if 'tier' not in old_df.columns:
+        old_df['tier'] = 0
+    if 'tier' not in new_df.columns:
+        new_df['tier'] = 0
+
     merged = old_df.merge(
-        new_df, on=["step", "confidence_level"], suffixes=("_old", "_new"), how="outer",
+        new_df, on=["step", "tier", "confidence_level"], suffixes=("_old", "_new"), how="outer",
     )
     merged["lower_delta"] = merged["rel_error_lower_bound_new"] - merged["rel_error_lower_bound_old"]
     merged["upper_delta"] = merged["rel_error_upper_bound_new"] - merged["rel_error_upper_bound_old"]
+    # Group by (tier, confidence_level) so anniversary CIs surface per-tier
+    # deltas; non-anniversary collapses to a single tier=0 group.
     grouped = (
-        merged.groupby("confidence_level")[["lower_delta", "upper_delta"]]
+        merged.groupby(["tier", "confidence_level"])[["lower_delta", "upper_delta"]]
         .agg(["mean", "min", "max", "count"])
     )
     lines = [f"## {label}", "", grouped.to_markdown(), ""]
