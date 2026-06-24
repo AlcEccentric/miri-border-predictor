@@ -30,7 +30,7 @@ def analyze_confidence_intervals_for_group(df_group, confidence_levels=[75, 90])
 
     step_intervals = {}
     for (step, tier), g in df_group.groupby(['step', 'tier']):
-        rel_err = g['relative_error']
+        rel_err = g['relative_error'].dropna()
         if len(rel_err) == 0:
             continue
         for confidence_level in confidence_levels:

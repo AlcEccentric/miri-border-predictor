@@ -363,41 +363,29 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
 
 
     configs[(5.0, (1.0,), 1000.0)] = GroupConfig(
-        early_stage_end=90,
-        mid_stage_end=190,
-        early_stage_k=3,  
-        mid_stage_k=3,    
+        early_stage_end=120,
+        mid_stage_end=235,
+        early_stage_k=5,  
+        mid_stage_k=4,    
         late_stage_k=3,
-        early_stage_lookback=30,  
+        early_stage_lookback=60,  
         mid_stage_lookback=40,    
-        late_stage_lookback=75,
-        early_stage_metric=DistanceMetric.RMSE,
-        mid_stage_metric=DistanceMetric.RMSE,
-        late_stage_metric=DistanceMetric.RMSE,
+        late_stage_lookback=25,
+        early_stage_scale_cap=(0.95, 1.05),
+        mid_stage_scale_cap=(0.95, 1.05),
+        late_stage_scale_cap=(0.9, 1.1),
+        early_stage_metric=DistanceMetric.SLOPE_AWARE,
+        mid_stage_metric=DistanceMetric.SLOPE_AWARE,
+        late_stage_metric=DistanceMetric.FINAL_DIFF,
         early_stage_use_ensemble=True,
         mid_stage_use_ensemble=True,  
         late_stage_use_ensemble=True,
         early_stage_use_smooth_for_neighbors=False,   
         mid_stage_use_smooth_for_neighbors=False,     
         late_stage_use_smooth_for_neighbors=False,
-        early_stage_use_smooth_for_prediction=True,
-        mid_stage_use_smooth_for_prediction=True,
-        late_stage_use_smooth_for_prediction=True,
-        early_stage_weights={
-            AlignmentMethod.RATIO: 1.0,
-            AlignmentMethod.AFFINE: 0.0,
-            AlignmentMethod.LINEAR: 0.0,
-        },
-        mid_stage_weights={
-            AlignmentMethod.RATIO: 1.0,
-            AlignmentMethod.AFFINE: 0.0,
-            AlignmentMethod.LINEAR: 0.0
-        },
-        late_stage_weights={
-            AlignmentMethod.RATIO: 1.0,
-            AlignmentMethod.AFFINE: 0.0,
-            AlignmentMethod.LINEAR: 0.0
-        }
+        early_stage_use_smooth_for_prediction=False,
+        mid_stage_use_smooth_for_prediction=False,
+        late_stage_use_smooth_for_prediction=False
     )
 
     # For Tune
