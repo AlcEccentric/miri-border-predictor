@@ -62,8 +62,25 @@ def _actually_interpolate_data(
     if np.any(valid_mask):
         x_valid = x[valid_mask]
         y_valid = scores[valid_mask]
-        interpolator = PchipInterpolator(x_valid, y_valid)
+        # ``extrapolate=False`` returns NaN for x outside [x_valid[0], x_valid[-1]].
+        # Without this, PchipInterpolator extrapolates with cubic Hermite
+        # polynomials, which produces wildly extreme values when raw data
+        # ends before the expected event end (e.g. an idol that falls off
+        # the top-N leaderboard partway through and stops being recorded).
+        interpolator = PchipInterpolator(x_valid, y_valid, extrapolate=False)
         interpolated_points = interpolator(x)
+
+        # Forward-fill before the first valid x and after the last valid x.
+        # Cumulative score data plateaus once observation stops, so treating
+        # the extrapolation region as "score stayed at the last known value"
+        # is the right semantics for our use case.
+        leading_nan_count = int(x_valid[0])
+        if leading_nan_count > 0:
+            interpolated_points[:leading_nan_count] = float(y_valid.iloc[0])
+        trailing_start = int(x_valid[-1]) + 1
+        if trailing_start < len(interpolated_points):
+            interpolated_points[trailing_start:] = float(y_valid.iloc[-1])
+
         scores = np.where(valid_mask, scores, interpolated_points)
 
     event_border_data['original_score'] = event_border_data['score']

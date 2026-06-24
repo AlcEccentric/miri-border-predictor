@@ -143,6 +143,28 @@ def cap_confidence_intervals(confidence_intervals: Dict[int, Tuple[float, float]
 _CI_CACHE: Dict[Tuple[float, float, float], pd.DataFrame] = {}
 
 
+def _resolve_tier(df: pd.DataFrame, requested_tier: int) -> int:
+    """Pick an effective tier that actually exists in the CI dataframe.
+
+    - No ``tier`` column (legacy / non-anniversary CSV): return 0.
+    - Requested tier present: use it.
+    - Requested tier absent: fall back to the nearest available tier by
+      numeric distance, breaking ties toward the lower (wider, more
+      conservative) tier.
+    """
+    if 'tier' not in df.columns:
+        return 0
+    available = sorted(int(t) for t in df['tier'].unique())
+    if requested_tier in available:
+        return requested_tier
+    nearest = min(available, key=lambda t: (abs(t - requested_tier), t))
+    logging.warning(
+        f"Requested CI tier {requested_tier} not present (available: {available}); "
+        f"falling back to nearest tier {nearest}."
+    )
+    return nearest
+
+
 def load_confidence_intervals(
     event_type: float,
     sub_type: float,
@@ -160,7 +182,8 @@ def load_confidence_intervals(
     ``tier`` defaults to ``0`` for non-anniversary CIs (single CI per step).
     For anniversary (type 5) CIs, callers should pass the target idol's
     quartile (1..4) computed from the current event's smoothed score
-    ranking at the prediction step.
+    ranking at the prediction step. If the requested tier is missing from
+    the CSV, the nearest available tier is used (see ``_resolve_tier``).
     """
     from src.storage.loader import load_ci_csv_from_r2
     from src.storage.r2_client import R2Client
@@ -172,40 +195,37 @@ def load_confidence_intervals(
     df = _CI_CACHE[cache_key]
 
     has_tier = 'tier' in df.columns
+    effective_tier = _resolve_tier(df, tier)
 
-    if has_tier:
-        # Filter by both step and tier; fall back to tier=0 if requested tier
-        # has no rows (e.g. legacy CSV that only has tier=0).
-        step_data = df[(df['step'] == step) & (df['tier'] == tier)]
-        if step_data.empty and (df['tier'] == tier).sum() == 0:
-            step_data = df[(df['step'] == step) & (df['tier'] == 0)]
-    else:
-        step_data = df[df['step'] == step]
+    def _rows_for(step_value: int) -> pd.DataFrame:
+        if has_tier:
+            return df[(df['step'] == step_value) & (df['tier'] == effective_tier)]
+        return df[df['step'] == step_value]
 
-    # If exact step not found, find closest step within 25 steps
+    step_data = _rows_for(step)
+
+    # If exact step not found, find closest step within 25 steps (within the
+    # resolved tier so the fallback stays self-consistent).
     if step_data.empty:
         if has_tier:
-            tier_subset = df[df['tier'] == tier]
-            if tier_subset.empty:
-                tier_subset = df[df['tier'] == 0]
-            available_steps = tier_subset['step'].unique()
+            available_steps = df[df['tier'] == effective_tier]['step'].unique()
         else:
             available_steps = df['step'].unique()
+        if len(available_steps) == 0:
+            raise ValueError(
+                f"No confidence interval rows for tier {effective_tier} "
+                f"(event_type={event_type}, sub_type={sub_type}, border={border})"
+            )
         closest_step = min(available_steps, key=lambda x: abs(x - step))
 
         if abs(closest_step - step) > 25:
             raise ValueError(
                 f"No confidence interval data found within 25 steps of step {step} "
-                f"for (event_type={event_type}, sub_type={sub_type}, border={border}, tier={tier}). "
-                f"Closest available step: {closest_step}"
+                f"for (event_type={event_type}, sub_type={sub_type}, border={border}, "
+                f"tier={effective_tier}). Closest available step: {closest_step}"
             )
 
-        if has_tier:
-            step_data = df[(df['step'] == closest_step) & (df['tier'] == tier)]
-            if step_data.empty:
-                step_data = df[(df['step'] == closest_step) & (df['tier'] == 0)]
-        else:
-            step_data = df[df['step'] == closest_step]
+        step_data = _rows_for(closest_step)
         logging.info(f"Using closest step {closest_step} for requested step {step}")
 
     intervals_map = {}
@@ -217,7 +237,7 @@ def load_confidence_intervals(
     if missing_levels:
         raise ValueError(
             f"Missing required confidence levels {sorted(missing_levels)} for step {step} "
-            f"(event_type={event_type}, sub_type={sub_type}, border={border}, tier={tier})"
+            f"(event_type={event_type}, sub_type={sub_type}, border={border}, tier={effective_tier})"
         )
 
     return intervals_map

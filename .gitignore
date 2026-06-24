@@ -6,6 +6,7 @@ dist/
 venv/
 .vscode/
 .env
+.kiro
 .DS_Store
 *.log
 *.json
