@@ -552,12 +552,12 @@ def main():
     # Hardcoded configuration - modify these values as needed
 
     CONFIG = {
-        'event_type': 5.0,
-        'sub_event_types': [1.0],
-        'border': 1000.0,
-        'steps': [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290],
+        'event_type': 4.0,
+        'sub_event_types': [2.0],
+        'border': 100.0,
+        'steps': [70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290],
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
-        'recent_count': 4,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
+        'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
         'look_back_event_cnt': 225,  # include only the N most recent past events of this event_type as candidates
         'log_level': 'INFO'
     }
