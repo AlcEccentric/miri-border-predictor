@@ -54,7 +54,14 @@ def _actually_interpolate_data(
             n_missing += 1
 
     if scores.notna().sum() < 2:
-        raise ValueError(f"Too few valid points for interpolating")
+        eid = first_row.get('event_id', '?')
+        iid = first_row.get('idol_id', '?')
+        bdr = first_row.get('border', '?')
+        raise ValueError(
+            f"Too few valid points for interpolating "
+            f"(event_id={eid}, idol_id={iid}, border={bdr}): "
+            f"{int(scores.notna().sum())} valid of {len(scores)} rows."
+        )
     
     # Interpolate missing data
     x = np.arange(len(scores))
