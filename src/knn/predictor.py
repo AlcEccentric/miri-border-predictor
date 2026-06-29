@@ -28,7 +28,7 @@ Public symbols used by other modules: ``predict_curve_knn``, ``get_filtered_df``
 """
 
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -75,8 +75,16 @@ def predict_curve_knn(
     norm_partial_data: pd.DataFrame,
     smooth_partial_data: pd.DataFrame,
     smooth_full_data: pd.DataFrame,
+    candidate_cache: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Predict the full score trajectory for ``(event_id, idol_id, border)``.
+
+    ``candidate_cache``: optional dict, scoped by the caller to a single
+    (event, step). The neighbour candidate pool depends only on
+    (search_df, exclude_event_id, current_step) — NOT on idol_id — so when
+    predicting all 52 idols of an anniversary event at the same step, passing
+    one shared dict lets the expensive groupby run once instead of 52x.
+    Production callers leave it None (no change in behaviour).
 
     Returns
     -------
@@ -106,6 +114,33 @@ def predict_curve_knn(
     config = get_group_config(event_type, sub_types, border)
     stage = get_stage_params(config, current_step)
 
+    common = dict(
+        event_id=event_id, idol_id=idol_id, border=border, sub_types=sub_types,
+        current_step=current_step, event_type=event_type, config=config,
+        norm_data=norm_data, norm_partial_data=norm_partial_data,
+        smooth_partial_data=smooth_partial_data, smooth_full_data=smooth_full_data,
+        candidate_cache=candidate_cache,
+    )
+    return _predict_for_stage(stage, **common)
+
+
+def _predict_for_stage(
+    stage,
+    *,
+    event_id: float,
+    idol_id: int,
+    border: float,
+    sub_types: tuple,
+    current_step: int,
+    event_type: float,
+    config,
+    norm_data: pd.DataFrame,
+    norm_partial_data: pd.DataFrame,
+    smooth_partial_data: pd.DataFrame,
+    smooth_full_data: pd.DataFrame,
+    candidate_cache: Optional[dict],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Produce a prediction for one fully-resolved set of stage parameters."""
     # Pick dataframes for neighbour search vs prediction
     sources = select_data_sources(
         event_id=event_id, idol_id=idol_id,
@@ -116,20 +151,30 @@ def predict_curve_knn(
     )
     current_scores_for_search = scores_of(sources.search_partial_df, event_id, idol_id)
 
-    # Build candidate set and find nearest neighbours
-    candidate_partials, candidate_ids = build_candidate_set(
-        search_df=sources.search_partial_df,
-        exclude_event_id=event_id,
-        current_step=current_step,
-        min_event_id=config.least_neighbor_id,
-        # Exclude only literally-unstarted candidates (score == 0 at the
-        # prediction step). Don't impose the target-side MIN_CURRENT_SCORE
-        # floor on neighbours — that would strip out small-magnitude
-        # candidates and force the pool to be much larger than the target,
-        # producing predictions inflated by ~1000x for type 5 low-popularity
-        # idols at small borders.
-        min_score_at_step=1.0,
-    )
+    # Build candidate set (or reuse a cached pool for this event+step). The
+    # pool is identical across idols of the same event/step, so a caller-
+    # supplied cache avoids rebuilding it 52x for anniversary events. The
+    # key includes use_smooth_for_neighbors because the search dataframe (and
+    # thus the pool) differs between stages that smooth and those that don't.
+    cache_key = (event_id, current_step, stage.use_smooth_for_neighbors)
+    if candidate_cache is not None and cache_key in candidate_cache:
+        candidate_partials, candidate_ids = candidate_cache[cache_key]
+    else:
+        candidate_partials, candidate_ids = build_candidate_set(
+            search_df=sources.search_partial_df,
+            exclude_event_id=event_id,
+            current_step=current_step,
+            min_event_id=config.least_neighbor_id,
+            # Exclude only literally-unstarted candidates (score == 0 at the
+            # prediction step). Don't impose the target-side MIN_CURRENT_SCORE
+            # floor on neighbours — that would strip out small-magnitude
+            # candidates and force the pool to be much larger than the target,
+            # producing predictions inflated by ~1000x for type 5 low-popularity
+            # idols at small borders.
+            min_score_at_step=1.0,
+        )
+        if candidate_cache is not None:
+            candidate_cache[cache_key] = (candidate_partials, candidate_ids)
     if not candidate_partials:
         raise ValueError(f"No valid historical partial trajectories for step {current_step}")
 

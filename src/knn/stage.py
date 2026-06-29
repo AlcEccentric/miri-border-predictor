@@ -11,6 +11,8 @@ have to juggle three parallel sets of config fields.
 picked for a given stage's smoothing preferences.
 """
 
+import threading
+import weakref
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -76,8 +78,48 @@ class DataSources:
 
 
 def scores_of(df: pd.DataFrame, event_id: float, idol_id: float) -> np.ndarray:
-    """Return the ordered score series for one ``(event_id, idol_id)`` in ``df``."""
-    return df[(df["event_id"] == event_id) & (df["idol_id"] == idol_id)]["score"].values
+    """Return the ordered score series for one ``(event_id, idol_id)`` in ``df``.
+
+    The naive implementation ``df[(df.event_id==e) & (df.idol_id==i)]["score"]``
+    is an O(N) boolean scan over the whole dataframe and gets called hundreds of
+    thousands of times during a backtest. Instead we build a one-time
+    ``{(event_id, idol_id): score_array}`` lookup per dataframe and cache it,
+    keyed by the dataframe object via a weak reference so it is evicted
+    automatically when the frame is garbage collected.
+
+    The cache is shared across threads (the normalised frames are reused by
+    every ``(event, step)`` task), so the (one-time) build is guarded by a lock.
+    Group order matches ``df`` row order, so results are identical to the scan.
+    """
+    groups = _scores_groups_for(df)
+    return groups.get((float(event_id), float(idol_id)), _EMPTY_SCORES)
+
+
+_EMPTY_SCORES = np.array([], dtype=float)
+# DataFrames are unhashable, so we cannot use them as dict keys directly.
+# Key by id(df) and drop the entry via weakref.finalize when the frame is GC'd
+# (which also guards against id reuse).
+_scores_cache: Dict[int, Dict[Tuple[float, float], np.ndarray]] = {}
+_scores_cache_lock = threading.Lock()
+
+
+def _scores_groups_for(df: pd.DataFrame) -> Dict[Tuple[float, float], np.ndarray]:
+    """Return (and build/cache) the ``(event_id, idol_id) -> scores`` map for ``df``."""
+    key = id(df)
+    cached = _scores_cache.get(key)
+    if cached is not None:
+        return cached
+    with _scores_cache_lock:
+        cached = _scores_cache.get(key)
+        if cached is not None:
+            return cached
+        groups: Dict[Tuple[float, float], np.ndarray] = {
+            (float(eid), float(iid)): g["score"].to_numpy()
+            for (eid, iid), g in df.groupby(["event_id", "idol_id"], sort=False)
+        }
+        _scores_cache[key] = groups
+        weakref.finalize(df, _scores_cache.pop, key, None)
+        return groups
 
 
 def select_data_sources(

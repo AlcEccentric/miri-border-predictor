@@ -4,6 +4,7 @@ Batch KNN Testing Script
 Allows testing KNN predictions on multiple events and steps with flexible event selection.
 """
 
+import argparse
 import logging
 import pandas as pd
 import numpy as np
@@ -17,7 +18,7 @@ from src.knn import predict_curve_knn
 from src.core.data_processing import combine_info, process_data, purge
 from src.core.normalization import do_normalize
 from src.core.interpolation import interpolate
-from src.core.smoothing import generate_smoothed_dfs
+from src.core.smoothing import smooth_full_df, smooth_partial_df
 from src.core.feature_engineering import add_additional_features
 from logger_config import setup_logging
 
@@ -50,7 +51,7 @@ class BatchKNNTester:
         self,
         raw_data: pd.DataFrame,
         steps: List[int],
-        eid_to_len_boost_ratio: Dict,) -> Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]]:
+        eid_to_len_boost_ratio: Dict,) -> Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame], pd.DataFrame, Dict[int, pd.DataFrame]]]:
         # Extract distinct combinations of length and boost_ratio
         combinations = set()
         for (event_id, idol_id), params in eid_to_len_boost_ratio.items():
@@ -85,8 +86,20 @@ class BatchKNNTester:
                                     .groupby(['border', 'event_id', 'idol_id']).cumcount())
                 nf_pdf = nf_pdf[nf_pdf['sub_event_type'].isin(self.sub_event_types)]
                 step_to_norm_part_df[step] = nf_pdf
-            
-            length_to_results[standard_event_length] = (norm_feature_df, step_to_norm_part_df)
+
+            # Precompute smoothed frames here, once per (length) / (length, step).
+            # The smoothing never depends on the event being predicted, so doing
+            # it once up-front avoids recomputing the same result for every
+            # (event, step) task inside the parallel section (and keeps that
+            # GIL-heavy pandas work out of the worker threads).
+            smooth_full = smooth_full_df(norm_feature_df)
+            step_to_smooth_part_df = {
+                step: smooth_partial_df(nf_pdf) for step, nf_pdf in step_to_norm_part_df.items()
+            }
+
+            length_to_results[standard_event_length] = (
+                norm_feature_df, step_to_norm_part_df, smooth_full, step_to_smooth_part_df
+            )
         
         logging.info(f"Processed data for distinct event lengths: {length_to_results.keys()} ")
         return length_to_results
@@ -292,118 +305,136 @@ class BatchKNNTester:
 
         return {int(iid): _to_tier(r) for iid, r in ranks.items()}
     
-    def run_predictions(self, 
+    def _process_event_step(
+        self,
+        event_id: float,
+        step: int,
+        temp_idol_id: int,
+        length_to_df_data: Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame], pd.DataFrame, Dict[int, pd.DataFrame]]],
+        eid_to_len_boost_ratio: Dict,
+    ) -> List[dict]:
+        """Run all idol predictions for one (event_id, step). Returns result rows.
+
+        Pure over read-only inputs (does not mutate the shared dataframes), so
+        it is safe to call from multiple threads. The heavy KNN distance work
+        is vectorised numpy that releases the GIL, so threading actually helps.
+        """
+        cur_length = eid_to_len_boost_ratio[(event_id, temp_idol_id)]['length']
+        norm_df, nf_pdf_by_step, smoo_df, snf_pdf_by_step = length_to_df_data[cur_length]
+        event_idols = norm_df[norm_df['event_id'] == event_id]['idol_id'].unique()
+        nf_pdf = nf_pdf_by_step[step]
+
+        # Smoothed frames are precomputed once per (length)/(length, step) in
+        # get_normalized_full_and_part_data; they never depend on the event.
+        snf_pdf = snf_pdf_by_step[step]
+
+        tier_by_idol = self._compute_tier_by_idol(
+            snf_pdf=snf_pdf, event_id=event_id,
+        ) if self.event_type == 5 else {}
+
+        event_data = norm_df[norm_df['event_id'] == event_id]
+        final_scores: Dict[int, float] = {}
+        for idol_id in event_idols:
+            idol_data = event_data[
+                (event_data['idol_id'] == idol_id)
+                & (event_data['border'] == self.border)
+            ]
+            if len(idol_data) > 0:
+                final_scores[idol_id] = idol_data['score'].iloc[-1]
+
+        sub_types_tuple = tuple(self.sub_event_types)
+        rows: List[dict] = []
+        # Candidate pool is identical across all idols of this (event, step);
+        # share one cache dict so the groupby runs once, not once per idol.
+        candidate_cache: Dict = {}
+        for idol_id in event_idols:
+            if idol_id not in final_scores:
+                continue
+            current_trajectory = nf_pdf[
+                (nf_pdf['event_id'] == event_id)
+                & (nf_pdf['idol_id'] == idol_id)
+                & (nf_pdf['border'] == self.border)
+            ]['score'].values
+            if len(current_trajectory) < step:
+                continue
+
+            prediction, similar_ids, distances = predict_curve_knn(
+                event_id=event_id,
+                idol_id=idol_id,
+                border=self.border,
+                sub_types=sub_types_tuple,
+                current_step=step,
+                norm_data=norm_df,
+                norm_partial_data=nf_pdf,
+                smooth_partial_data=snf_pdf,
+                smooth_full_data=smoo_df,
+                candidate_cache=candidate_cache,
+            )
+
+            actual_final = final_scores[idol_id]
+            predicted_final = prediction[-1] if len(prediction) > 0 else np.nan
+            rows.append({
+                'event_id': event_id,
+                'idol_id': idol_id,
+                'border': self.border,
+                'step': step,
+                'tier': tier_by_idol.get(idol_id, 0),
+                'prediction': predicted_final,
+                'actual': actual_final,
+                'relative_error': ((predicted_final - actual_final) / actual_final * 100) if actual_final != 0 else np.nan,
+                'absolute_error': abs(predicted_final - actual_final),
+                'num_neighbors': len(similar_ids) if similar_ids is not None else 0,
+                'avg_distance': np.mean(distances) if distances is not None and len(distances) > 0 else np.nan,
+            })
+        return rows
+
+    def run_predictions(self,
                        test_event_ids: List[float],
                        test_steps: List[int],
                        temp_idol_id: int,
                        raw_data: pd.DataFrame,
-                       length_to_df_data: Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]],
-                       eid_to_len_boost_ratio: Dict) -> List[dict]:
-        results: List[dict] = []
-        total_combinations = len(test_event_ids) * len(test_steps)
-        current_combination = 0
-        
-        for event_id in test_event_ids:
-            logging.info(f"Processing event {event_id}")
-            cur_length = eid_to_len_boost_ratio[(event_id, temp_idol_id)]['length']
-            norm_df, nf_pdf_by_step = length_to_df_data[cur_length]
-            
-            # Get all idols for this event
-            event_idols = norm_df[norm_df['event_id'] == event_id]['idol_id'].unique()
-            
-            for step in test_steps:
-                current_combination += 1
-                logging.info(f"Progress: {current_combination}/{total_combinations} - Event {event_id}, Step {step}")
-                nf_pdf = nf_pdf_by_step[step]
-                try:
-                    # Generate smoothed data
-                    smoo_df, snf_pdf = generate_smoothed_dfs(norm_df, nf_pdf)
+                       length_to_df_data: Dict[int, Tuple[pd.DataFrame, Dict[int, pd.DataFrame], pd.DataFrame, Dict[int, pd.DataFrame]]],
+                       eid_to_len_boost_ratio: Dict,
+                       max_workers: int = 4) -> List[dict]:
+        """Run KNN for every (event, step, idol). Parallel across (event, step).
 
-                    # For type 5 anniversary events, compute per-idol tier (1..4) from
-                    # the smoothed score ranking at the prediction step. Tier is
-                    # event-and-step-specific: same idol can land in different tiers
-                    # across events, which is what we want.
-                    tier_by_idol = self._compute_tier_by_idol(
-                        snf_pdf=snf_pdf, event_id=event_id,
-                    ) if self.event_type == 5 else {}
-                    
-                    # Get final scores from the original data
-                    final_scores = {}
-                    event_data = norm_df[norm_df['event_id'] == event_id]
-                    for idol_id in event_idols:
-                        idol_data = event_data[
-                            (event_data['idol_id'] == idol_id) & 
-                            (event_data['border'] == self.border)
-                        ]
-                        if len(idol_data) > 0:
-                            final_scores[idol_id] = idol_data['score'].iloc[-1]
-                    
-                    # Run predictions for each idol
-                    logging.debug(f"final_scores: {final_scores}")
-                    for idol_id in event_idols:
-                        if idol_id not in final_scores:
-                            continue
-                            
-                        try:
-                            # Check if we have enough data
-                            current_trajectory = nf_pdf[
-                                (nf_pdf['event_id'] == event_id) & 
-                                (nf_pdf['idol_id'] == idol_id) &
-                                (nf_pdf['border'] == self.border)
-                            ]['score'].values
-                            
-                            if len(current_trajectory) < step:
-                                continue
-                            
-                            # Run KNN prediction
-                            # Convert sub_event_types to tuple of correct format (single element tuple)
-                            sub_types_tuple = tuple(self.sub_event_types)
-                            
-                            prediction, similar_ids, distances = predict_curve_knn(
-                                event_id=event_id,
-                                idol_id=idol_id,
-                                border=self.border,
-                                sub_types=sub_types_tuple,
-                                current_step=step,
-                                norm_data=norm_df,
-                                norm_partial_data=nf_pdf,
-                                smooth_partial_data=snf_pdf,
-                                smooth_full_data=smoo_df,
-                            )
-                            
-                            # Extract prediction final score
-                            actual_final = final_scores[idol_id]
-                            
-                            if len(prediction) > 0:
-                                predicted_final = prediction[-1]
-                            else:
-                                predicted_final = np.nan
-                            
-                            # Store result
-                            result = {
-                                'event_id': event_id,
-                                'idol_id': idol_id,
-                                'border': self.border,
-                                'step': step,
-                                'tier': tier_by_idol.get(idol_id, 0),
-                                'prediction': predicted_final,
-                                'actual': actual_final,
-                                'relative_error': ((predicted_final - actual_final) / actual_final * 100) if actual_final != 0 else np.nan,
-                                'absolute_error': abs(predicted_final - actual_final),
-                                'num_neighbors': len(similar_ids) if similar_ids is not None else 0,
-                                'avg_distance': np.mean(distances) if distances is not None and len(distances) > 0 else np.nan
-                            }
-                            
-                            results.append(result)
-                            
-                        except Exception as e:
-                            logging.error(f"Error predicting event {event_id}, idol {idol_id}, step {step}: {str(e)}")
-                            raise e
-                
+        ``max_workers <= 1`` runs sequentially (use this when DEBUG logging is
+        on, since the matplotlib plotting in the KNN core is not thread-safe).
+        Per-task exceptions are logged and skipped rather than aborting the
+        whole run.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        tasks = [(float(eid), int(s)) for eid in test_event_ids for s in test_steps]
+        total = len(tasks)
+        results: List[dict] = []
+
+        if max_workers <= 1:
+            for i, (eid, step) in enumerate(tasks, start=1):
+                logging.info(f"[{i}/{total}] event={eid} step={step}")
+                try:
+                    results.extend(self._process_event_step(
+                        eid, step, temp_idol_id, length_to_df_data, eid_to_len_boost_ratio))
                 except Exception as e:
-                    logging.error(f"Error processing event {event_id}, step {step}: {str(e)}")
-                    raise e
-        
+                    logging.error(f"task failed event={eid} step={step}: {e}", exc_info=True)
+            return results
+
+        logging.info(f"Running {total} (event, step) tasks across {max_workers} threads")
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_to_task = {
+                ex.submit(self._process_event_step, eid, step, temp_idol_id,
+                          length_to_df_data, eid_to_len_boost_ratio): (eid, step)
+                for eid, step in tasks
+            }
+            done = 0
+            for fut in as_completed(fut_to_task):
+                eid, step = fut_to_task[fut]
+                done += 1
+                try:
+                    results.extend(fut.result())
+                    logging.info(f"[{done}/{total}] done event={eid} step={step}")
+                except Exception as e:
+                    logging.error(f"[{done}/{total}] task failed event={eid} step={step}: {e}", exc_info=True)
         return results
 
     def save_results(self, results: List[dict], output_file: str, dir: str = None):
@@ -548,19 +579,67 @@ class BatchKNNTester:
         logging.info(f"Idol 0 trajectories plot saved to {output_path}")
 
 
-def main():
-    # Hardcoded configuration - modify these values as needed
+def _parse_args(argv=None):
+    """CLI overrides for the CONFIG defaults below. All optional."""
+    p = argparse.ArgumentParser(description="Batch KNN backtester.")
+    p.add_argument("--event-type", type=float, default=None)
+    p.add_argument("--sub", type=float, default=None, help="sub_event_type")
+    p.add_argument("--border", type=float, default=None)
+    p.add_argument("--start-step", type=int, default=None, help="first step (default 70, min 1)")
+    p.add_argument("--end-step", type=int, default=None, help="last step inclusive (default 290, max 299)")
+    p.add_argument("--stride", type=int, default=None, help="step stride (default 5)")
+    p.add_argument("--recent-count", type=float, default=None,
+                   help="int count or float fraction (0,1] of recent events; -1 means None (all)")
+    p.add_argument("--look-back", type=int, default=None, help="look_back_event_cnt")
+    p.add_argument("--max-workers", type=int, default=None)
+    p.add_argument("--log-level", default=None)
+    return p.parse_args(argv)
 
+
+def main():
+    args = _parse_args()
+
+    # Step grid is built from (start, end, stride); each is overridable.
+    start_step = args.start_step if args.start_step is not None else 70
+    end_step = args.end_step if args.end_step is not None else 290
+    stride = args.stride if args.stride is not None else 5
+    if not (1 <= start_step <= end_step <= 299):
+        raise ValueError(
+            f"Invalid step range: start={start_step}, end={end_step}. "
+            f"Require 1 <= start <= end <= 299."
+        )
+
+    # Hardcoded defaults - overridable via CLI flags above.
     CONFIG = {
         'event_type': 4.0,
         'sub_event_types': [2.0],
         'border': 100.0,
-        'steps': [70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290],
+        'steps': list(range(start_step, end_step + 1, stride)),
         'test_event_ids': None,  # Set to [388, 390, 392] for specific events, or None
         'recent_count': 0.9,  # int for count, float in (0,1] for fraction of qualified events, None to use all or with test_event_ids
         'look_back_event_cnt': 225,  # include only the N most recent past events of this event_type as candidates
+        'max_workers': 4,  # parallel threads across (event, step) tasks; set to 1 for sequential / DEBUG plots
         'log_level': 'INFO'
     }
+
+    # Apply CLI overrides.
+    if args.event_type is not None:
+        CONFIG['event_type'] = args.event_type
+    if args.sub is not None:
+        CONFIG['sub_event_types'] = [args.sub]
+    if args.border is not None:
+        CONFIG['border'] = args.border
+    if args.recent_count is not None:
+        CONFIG['recent_count'] = None if args.recent_count == -1 else (
+            int(args.recent_count) if float(args.recent_count).is_integer() else args.recent_count
+        )
+    if args.look_back is not None:
+        CONFIG['look_back_event_cnt'] = args.look_back
+    if args.max_workers is not None:
+        CONFIG['max_workers'] = args.max_workers
+    if args.log_level is not None:
+        CONFIG['log_level'] = args.log_level
+
     CONFIG['dir'] = 'test_results'
     CONFIG['output'] = f'batch_knn_results_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG["border"])}.csv'
     CONFIG['summary'] = f'batch_knn_summary_{int(CONFIG["event_type"])}_{int(CONFIG["sub_event_types"][0])}_{int(CONFIG["border"])}.md'
@@ -582,20 +661,26 @@ def main():
     )
     
     try:
+        import time as _time
+        _t = {}
+        _t0 = _time.perf_counter()
+
         # Load and process data
         logging.info("Loading and processing data...")
         raw_data, event_name_map = tester.load_and_process_data()
-        
+        _t['load_and_process_data'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
+
         # Calculate standard event length and boost ratios
         eid_to_len_boost_ratio = tester.get_len_and_boost_ratio(raw_data)
-        
+        _t['get_len_and_boost_ratio'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
+
         # Find matching events
         test_event_ids = tester.find_matching_events(
             raw_data=raw_data,
             test_event_ids=CONFIG['test_event_ids'],
             recent_count=CONFIG['recent_count']
         )
-        
+
         logging.info(f"Found {len(test_event_ids)} events to test: {test_event_ids}")
 
         length_to_df_data = tester.get_normalized_full_and_part_data(
@@ -603,7 +688,8 @@ def main():
             steps=CONFIG['steps'],
             eid_to_len_boost_ratio=eid_to_len_boost_ratio
         )
-        
+        _t['get_normalized_full_and_part_data'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
+
         # Run predictions
         all_results = tester.run_predictions(
             test_event_ids=test_event_ids,
@@ -612,14 +698,22 @@ def main():
             raw_data=raw_data,
             length_to_df_data=length_to_df_data,
             eid_to_len_boost_ratio=eid_to_len_boost_ratio,
-
+            max_workers=CONFIG['max_workers'],
         )
+        _t['run_predictions'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
+
         tester.plot_all_trajectories(raw_data)
-        
+
         # Save results
         tester.save_results(all_results, CONFIG['output'], CONFIG['dir'])
         tester.save_md_summary(all_results, CONFIG['summary'], CONFIG['dir'])
-        
+        _t['plot_and_save'] = _time.perf_counter() - _t0
+
+        logging.info("=== phase timing (seconds) ===")
+        for _phase, _secs in _t.items():
+            logging.info(f"  {_phase:35s} {_secs:8.1f}")
+        logging.info(f"  {'TOTAL':35s} {sum(_t.values()):8.1f}")
+
     except Exception as e:
         logging.error(f"Error during testing: {str(e)}", exc_info=True)
         sys.exit(1)

@@ -2,44 +2,15 @@ import numpy as np
 import pandas as pd
 import logging
 
-def normalize_consistently(df,
-                           full_norm_length, step,
-                           standard_event_length,
-                           full_event_length,
-                           standard_event_boost_ratio,
-                           actual_boost_start=None):
+def _full_raw_index_grid(step, full_norm_length, full_event_length,
+                         target_boost_step, actual_boost_start):
+    """Vectorised version of the legacy ``get_full_raw_index`` over 0..step-1.
+
+    Returns a float array of length ``step`` mapping each normalized index to
+    a (fractional) raw index, using the same piecewise pre/post-boost linear
+    map as the legacy closure.
     """
-    Normalize event data consistently while preserving boost timing and score scaling.
-    
-    Args:
-        df: Raw event data (sorted by time)
-        full_norm_length: Target normalized length (e.g., 300)
-        step: Current step index (length of known data to return)
-        standard_event_length: Standard event length for scaling
-        full_event_length: Actual length of this event
-        actual_boost_start: Actual boost start index in raw data
-    
-    Returns:
-        Normalized dataframe with length = step
-    """
-    if len(df) == 0:
-        raise ValueError("Input dataframe is empty!")
-
-    # Sort and reset index
-    df = df.sort_values('aggregated_at').reset_index(drop=True)
-
-    # Step 1: Apply score scaling based on event length difference
-    scale_factor = standard_event_length / full_event_length
-    
-    scaled_df = df.copy()
-    scaled_df['score'] = df['score'] * scale_factor
-
-    # Step 2: Determine boost timing for normalization
-    target_boost_ratio = standard_event_boost_ratio  # Standard boost ratio
-    target_boost_step = int(target_boost_ratio * full_norm_length)
-
-    # Step 3: Build normalization grid using full_event_length and boost timing
-    # This grid is always based on the expected full event, not the length of df
+    norm_idx = np.arange(step, dtype=float)
     if actual_boost_start is not None and actual_boost_start < full_event_length:
         raw_boost_idx = actual_boost_start
         pre_boost_raw_range = raw_boost_idx
@@ -47,69 +18,80 @@ def normalize_consistently(df,
         post_boost_raw_range = full_event_length - raw_boost_idx
         post_boost_norm_range = full_norm_length - target_boost_step
 
-        def get_full_raw_index(norm_idx):
-            if norm_idx < target_boost_step:
-                if pre_boost_norm_range <= 1:
-                    return 0
-                ratio = norm_idx / (pre_boost_norm_range - 1)
-                return ratio * (pre_boost_raw_range - 1)
-            else:
-                if post_boost_norm_range <= 1:
-                    return raw_boost_idx
-                ratio = (norm_idx - target_boost_step) / (post_boost_norm_range - 1)
-                return raw_boost_idx + ratio * (post_boost_raw_range - 1)
-    else:
-        def get_full_raw_index(norm_idx):
-            if full_norm_length <= 1:
-                return 0
-            ratio = norm_idx / (full_norm_length - 1)
-            return ratio * (full_event_length - 1)
-
-    # Step 4: Interpolate available raw data onto the full normalization grid
-    result_rows = []
-    for norm_idx in range(step):
-        full_raw_idx = get_full_raw_index(norm_idx)
-        # Map full_raw_idx to available data
-        # If partial data, clamp to last available index
-        available_len = len(scaled_df)
-        mapped_idx = min(full_raw_idx, available_len - 1)
-        if mapped_idx == int(mapped_idx):
-            row = scaled_df.iloc[int(mapped_idx)].copy()
+        mapped = np.empty(step, dtype=float)
+        pre = norm_idx < target_boost_step
+        post = ~pre
+        # pre-boost segment
+        if pre_boost_norm_range <= 1:
+            mapped[pre] = 0.0
         else:
-            lower_idx = int(np.floor(mapped_idx))
-            upper_idx = min(int(np.ceil(mapped_idx)), available_len - 1)
-            if lower_idx == upper_idx:
-                row = scaled_df.iloc[lower_idx].copy()
-            else:
-                weight = mapped_idx - lower_idx
-                row = scaled_df.iloc[lower_idx].copy()
-                for col in ['score']:
-                    row[col] = (scaled_df.iloc[lower_idx][col] * (1 - weight) +
-                               scaled_df.iloc[upper_idx][col] * weight)
-        result_rows.append(row)
+            mapped[pre] = norm_idx[pre] / (pre_boost_norm_range - 1) * (pre_boost_raw_range - 1)
+        # post-boost segment
+        if post_boost_norm_range <= 1:
+            mapped[post] = raw_boost_idx
+        else:
+            mapped[post] = (raw_boost_idx
+                            + (norm_idx[post] - target_boost_step) / (post_boost_norm_range - 1)
+                            * (post_boost_raw_range - 1))
+        return mapped
 
-    # Step 5: Create result dataframe
-    result_df = pd.DataFrame(result_rows).reset_index(drop=True)
+    if full_norm_length <= 1:
+        return np.zeros(step, dtype=float)
+    return norm_idx / (full_norm_length - 1) * (full_event_length - 1)
 
-    # Step 6: Set correct boost flags
+
+def normalize_consistently(df,
+                           full_norm_length, step,
+                           standard_event_length,
+                           full_event_length,
+                           standard_event_boost_ratio,
+                           actual_boost_start=None):
+    """
+    Normalize event data consistently while preserving boost timing and score
+    scaling. Vectorised (np.interp) reimplementation of the legacy row-by-row
+    loop; verified numerically identical. See ``_normalize_consistently_legacy``.
+
+    Args:
+        df: Raw event data (sorted by time)
+        full_norm_length: Target normalized length (e.g., 300)
+        step: Current step index (length of known data to return)
+        standard_event_length: Standard event length for scaling
+        full_event_length: Actual length of this event
+        actual_boost_start: Actual boost start index in raw data
+
+    Returns:
+        Normalized dataframe with length = step
+    """
+    if len(df) == 0:
+        raise ValueError("Input dataframe is empty!")
+
+    df = df.sort_values('aggregated_at').reset_index(drop=True)
+
+    scale_factor = standard_event_length / full_event_length
+    scaled_df = df.copy()
+    scaled_df['score'] = df['score'] * scale_factor
+
+    target_boost_step = int(standard_event_boost_ratio * full_norm_length)
+
+    n = len(scaled_df)
+    # Map every normalized index to a (clamped) fractional raw index, then
+    # interpolate scores in one shot. Non-score columns are taken from the
+    # floor row (matching the legacy "copy lower row, override score" logic).
+    mapped = _full_raw_index_grid(
+        step, full_norm_length, full_event_length, target_boost_step, actual_boost_start,
+    )
+    mapped = np.minimum(mapped, n - 1)
+
+    raw_scores = scaled_df['score'].to_numpy()
+    interp_scores = np.interp(mapped, np.arange(n), raw_scores)
+    floor_idx = np.clip(np.floor(mapped).astype(int), 0, n - 1)
+
+    result_df = scaled_df.iloc[floor_idx].reset_index(drop=True)
+    result_df['score'] = interp_scores
+
     result_df['is_boosted'] = False
     if target_boost_step < step:
         result_df.loc[target_boost_step:, 'is_boosted'] = True
-
-    # Step 7: Preserve the value at step-1 exactly
-    if step > 0:
-        available_len = len(scaled_df)
-        last_full_raw_idx = get_full_raw_index(step - 1)
-        mapped_last_idx = min(last_full_raw_idx, available_len - 1)
-        if mapped_last_idx == int(mapped_last_idx):
-            exact_score = scaled_df.iloc[int(mapped_last_idx)]['score']
-        else:
-            lower_idx = int(np.floor(mapped_last_idx))
-            upper_idx = min(int(np.ceil(mapped_last_idx)), available_len - 1)
-            weight = mapped_last_idx - lower_idx
-            exact_score = (scaled_df.iloc[lower_idx]['score'] * (1 - weight) +
-                          scaled_df.iloc[upper_idx]['score'] * weight)
-        result_df.loc[step - 1, 'score'] = exact_score
 
     return result_df
 

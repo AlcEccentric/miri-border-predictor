@@ -162,6 +162,61 @@ def build_candidate_set(
     return trajectories, ids
 
 
+def _vectorized_window_distances(
+    current_full: np.ndarray,
+    cand_matrix: np.ndarray,
+    lookback: int,
+    metric: DistanceMetric,
+    slope_weight: float,
+    use_trend_weighting: bool,
+    trend_weight: float,
+) -> np.ndarray:
+    """Distance from ``current_full`` to every row of ``cand_matrix`` at once.
+
+    ``cand_matrix`` is ``(n_candidates, L)`` where every candidate has the
+    same length ``L`` (they are all sliced to ``current_step`` upstream).
+    Returns a length-``n_candidates`` array. Produces the same numbers as
+    looping ``trajectory_distance`` over each row, for the RMSE / FINAL_DIFF /
+    SLOPE_AWARE / trend-weighted-RMSE paths. DTW is handled by the caller.
+    """
+    cur_win = current_full[-lookback:]
+    cand_win = cand_matrix[:, -lookback:]
+    diff = cand_win - cur_win  # (n, w)
+
+    if use_trend_weighting and metric == DistanceMetric.RMSE:
+        recent = min(30, lookback)
+        cur_recent = current_full[-recent:]
+        cand_recent = cand_matrix[:, -recent:]
+        cur_d = np.diff(cur_recent)
+        cand_d = np.diff(cand_recent, axis=1)
+        trend = np.mean(np.abs(cand_d - cur_d), axis=1)
+        rmse = np.sqrt(np.mean(diff ** 2, axis=1))
+        return (1 - trend_weight) * rmse + trend_weight * trend
+
+    if metric == DistanceMetric.RMSE:
+        return np.sqrt(np.mean(diff ** 2, axis=1))
+
+    if metric == DistanceMetric.FINAL_DIFF:
+        return np.mean(np.abs(diff), axis=1)
+
+    if metric == DistanceMetric.SLOPE_AWARE:
+        if lookback < 2:
+            return np.sqrt(np.mean(diff ** 2, axis=1))
+        eps = 1e-9
+        a_slope = float(slope_weight)
+        a_level = max(0.0, 1.0 - a_slope)
+        scale_level = float(np.abs(np.mean(cur_win))) + eps
+        d_level = np.sqrt(np.mean(diff ** 2, axis=1)) / scale_level
+        cur_slope = np.diff(cur_win)
+        cand_slope = np.diff(cand_win, axis=1)
+        scale_slope = float(np.abs(np.mean(cur_slope))) + eps
+        d_slope = np.sqrt(np.mean((cand_slope - cur_slope) ** 2, axis=1)) / scale_slope
+        return a_level * d_level + a_slope * d_slope
+
+    # Fallback (shouldn't reach here; DTW handled by caller)
+    return np.sqrt(np.mean(diff ** 2, axis=1))
+
+
 def find_nearest_neighbors(
     current_partial: np.ndarray,
     candidate_partials: List[np.ndarray],
@@ -177,26 +232,41 @@ def find_nearest_neighbors(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return the top-k nearest neighbours and their distances.
 
-    Candidates shorter than ``current_step`` are skipped.
+    Candidates shorter than ``current_step`` are skipped. The distance is
+    computed vectorised for RMSE / FINAL_DIFF / SLOPE_AWARE / trend-weighted
+    RMSE (the common paths); DTW falls back to the per-candidate loop.
     """
     if not candidate_partials:
         raise ValueError(f"No candidate trajectories for step {current_step}")
 
-    distances: List[float] = []
-    kept_indices: List[int] = []
-    for idx, candidate in enumerate(candidate_partials):
-        if len(candidate) < current_step:
-            continue
-        distances.append(trajectory_distance(
-            current_partial, candidate, lookback, metric,
-            event_type, sub_types, border, slope_weight,
-        ))
-        kept_indices.append(idx)
-
-    if not distances:
+    kept = [(i, c) for i, c in enumerate(candidate_partials) if len(c) >= current_step]
+    if not kept:
         raise ValueError(f"No comparable candidate trajectories at step {current_step}")
+    kept_indices = [i for i, _ in kept]
 
-    distance_arr = np.array(distances)
+    if metric == DistanceMetric.DTW:
+        # Inherently sequential; keep the loop.
+        distance_arr = np.array([
+            trajectory_distance(
+                current_partial, c, lookback, metric,
+                event_type, sub_types, border, slope_weight,
+            )
+            for _, c in kept
+        ])
+    else:
+        # All kept candidates share length current_step -> stack and vectorise.
+        cand_matrix = np.vstack([c[:current_step] for _, c in kept])
+        config = get_group_config(event_type, sub_types, border)
+        distance_arr = _vectorized_window_distances(
+            current_full=np.asarray(current_partial),
+            cand_matrix=cand_matrix,
+            lookback=lookback,
+            metric=metric,
+            slope_weight=slope_weight,
+            use_trend_weighting=bool(config.use_trend_weighting),
+            trend_weight=float(config.trend_weight),
+        )
+
     id_arr = np.array(candidate_ids)[kept_indices]
     k_effective = min(k, len(distance_arr))
     top_k_order = np.argsort(distance_arr)[:k_effective]
