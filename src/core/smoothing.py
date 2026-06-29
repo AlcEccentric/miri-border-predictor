@@ -294,23 +294,35 @@ def get_optimized_smoothing_config(event_type: float, sub_event_type: float, bor
 def generate_smoothed_dfs(norm_full_df: pd.DataFrame, 
                           norm_part_df: pd.DataFrame, ) -> tuple:
     """Generate smoothed full and partial dataframes"""
+    return smooth_full_df(norm_full_df), smooth_partial_df(norm_part_df)
 
-    # Process full trajectories
-    smoothed_full_df = pd.DataFrame()
-    for (event_type, sub_event_type, idol_id, border), group in norm_full_df.groupby(['event_type', 'sub_event_type', 'idol_id', 'border']):
-        ranges = get_optimized_smoothing_config(event_type, sub_event_type, border)
-        group_smoothed = smooth_scores_multi_range(group, ranges, end_transition_points=5)
-        smoothed_full_df = pd.concat([smoothed_full_df, group_smoothed])
-    
-    # Process partial trajectories
-    smoothed_step_df = pd.DataFrame()
-    for (event_type, sub_event_type, _, border), group in norm_part_df.groupby(['event_type', 'sub_event_type', 'idol_id', 'border']):
-        ranges = get_optimized_smoothing_config(event_type, sub_event_type, border)
-        group_smoothed = smooth_scores_multi_range(group, ranges, end_transition_points=0)
-        smoothed_step_df = pd.concat([smoothed_step_df, group_smoothed])
-    
-    # Sort and reset index
-    smoothed_full_df = smoothed_full_df.sort_values(['event_id', 'idol_id', 'border', 'time_idx']).reset_index(drop=True)
-    smoothed_step_df = smoothed_step_df.sort_values(['event_id', 'idol_id', 'border', 'time_idx']).reset_index(drop=True)
 
-    return smoothed_full_df, smoothed_step_df
+def _smooth_grouped(df: pd.DataFrame, end_transition_points: int) -> pd.DataFrame:
+    """Smooth each (event_type, sub_event_type, idol_id, border) group and concat.
+
+    Collects the per-group results into a list and concatenates once at the end
+    rather than concatenating inside the loop (which is O(N^2)). Group iteration
+    order is preserved, and the callers sort afterwards, so the result is
+    identical to the previous implementation.
+    """
+    parts = []
+    for (event_type, sub_event_type, idol_id, border), group in df.groupby(
+        ['event_type', 'sub_event_type', 'idol_id', 'border']
+    ):
+        ranges = get_optimized_smoothing_config(event_type, sub_event_type, border)
+        parts.append(smooth_scores_multi_range(group, ranges, end_transition_points=end_transition_points))
+    if not parts:
+        return df.iloc[0:0].copy()
+    return pd.concat(parts)
+
+
+def smooth_full_df(norm_full_df: pd.DataFrame) -> pd.DataFrame:
+    """Smoothed full trajectories (end_transition_points=5). Depends only on the full df."""
+    out = _smooth_grouped(norm_full_df, end_transition_points=5)
+    return out.sort_values(['event_id', 'idol_id', 'border', 'time_idx']).reset_index(drop=True)
+
+
+def smooth_partial_df(norm_part_df: pd.DataFrame) -> pd.DataFrame:
+    """Smoothed partial trajectories (end_transition_points=0). Depends only on the partial df."""
+    out = _smooth_grouped(norm_part_df, end_transition_points=0)
+    return out.sort_values(['event_id', 'idol_id', 'border', 'time_idx']).reset_index(drop=True)
