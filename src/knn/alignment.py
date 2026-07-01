@@ -293,12 +293,13 @@ def single_method_predict(
     scale_cap: Tuple[float, float],
     disable_scale: bool,
     neighbor_ids: Optional[np.ndarray] = None,
+    weights: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Weighted average of neighbour curves aligned with a single method."""
     if align_lookback is None:
         align_lookback = current_step
 
-    weights = _single_method_weights(distances)
+    weights = _single_method_weights(distances) if weights is None else weights
     ratio_lower, ratio_upper = _neighbor_scale_cap(
         neighbor_full_list, neighbor_partial_list, current_step, align_lookback,
     )
@@ -346,6 +347,7 @@ def ensemble_predict(
     scale_cap: Tuple[float, float],
     disable_scale: bool,
     neighbor_ids: Optional[np.ndarray] = None,
+    weights: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Blend per-method predictions using ``method_weights``.
 
@@ -353,7 +355,7 @@ def ensemble_predict(
     neighbours, then blend the per-method results by ``method_weights``.
     """
     TOLERANCE = 0.2
-    neighbor_weights = _ensemble_weights(distances)
+    neighbor_weights = _ensemble_weights(distances) if weights is None else weights
 
     ratio_lower, ratio_upper = _neighbor_scale_cap(
         neighbor_full_list, neighbor_partial_list, current_step, align_lookback,

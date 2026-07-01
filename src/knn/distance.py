@@ -229,12 +229,23 @@ def find_nearest_neighbors(
     sub_types: Tuple[float],
     border: float,
     slope_weight: float,
+    target_idol_id: float = None,
+    same_idol_distance_factor: float = 1.0,
+    pool_k: int = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return the top-k nearest neighbours and their distances.
 
     Candidates shorter than ``current_step`` are skipped. The distance is
     computed vectorised for RMSE / FINAL_DIFF / SLOPE_AWARE / trend-weighted
     RMSE (the common paths); DTW falls back to the per-candidate loop.
+
+    If ``same_idol_distance_factor`` < 1.0 and ``target_idol_id`` is given,
+    candidates sharing the target's idol_id have their distance multiplied by
+    that factor, biasing selection toward the same idol across other events.
+
+    ``pool_k`` overrides how many neighbours are returned (default ``k``). Soft
+    (kernel-weighted) callers pass a larger pool so the caller can fade distant
+    neighbours smoothly instead of relying on the hard rank-k cutoff.
     """
     if not candidate_partials:
         raise ValueError(f"No candidate trajectories for step {current_step}")
@@ -268,6 +279,12 @@ def find_nearest_neighbors(
         )
 
     id_arr = np.array(candidate_ids)[kept_indices]
-    k_effective = min(k, len(distance_arr))
+
+    # Bias toward the same idol across other events, if requested.
+    if same_idol_distance_factor != 1.0 and target_idol_id is not None and len(id_arr):
+        same_idol = id_arr[:, 1] == target_idol_id
+        distance_arr = distance_arr * np.where(same_idol, same_idol_distance_factor, 1.0)
+
+    k_effective = min(pool_k if pool_k else k, len(distance_arr))
     top_k_order = np.argsort(distance_arr)[:k_effective]
     return distance_arr[top_k_order], id_arr[top_k_order]

@@ -112,7 +112,6 @@ def predict_curve_knn(
         & (norm_partial_data["idol_id"] == idol_id)
     ].iloc[0]["event_type"]
     config = get_group_config(event_type, sub_types, border)
-    stage = get_stage_params(config, current_step)
 
     common = dict(
         event_id=event_id, idol_id=idol_id, border=border, sub_types=sub_types,
@@ -121,7 +120,58 @@ def predict_curve_knn(
         smooth_partial_data=smooth_partial_data, smooth_full_data=smooth_full_data,
         candidate_cache=candidate_cache,
     )
-    return _predict_for_stage(stage, **common)
+
+    # If we are within the blend half-width of a stage boundary, compute the
+    # prediction for BOTH adjacent stages and linearly blend them. This removes
+    # the discontinuous jump a forecast shows as current_step crosses the
+    # boundary (the whole method - k, metric, ensemble, weights - changes at
+    # once). Outside the transition window we run a single stage as before.
+    blend = _blend_spec(current_step, config)
+    if blend is None:
+        stage = get_stage_params(config, current_step)
+        return _predict_for_stage(stage, **common)
+
+    boundary, w_upper = blend
+    stage_lower = get_stage_params(config, boundary - 1)
+    stage_upper = get_stage_params(config, boundary)
+    pred_l, nids_l, dist_l = _predict_for_stage(stage_lower, **common)
+    pred_u, nids_u, dist_u = _predict_for_stage(stage_upper, **common)
+
+    if len(pred_l) == 0:
+        return pred_u, nids_u, dist_u
+    if len(pred_u) == 0:
+        return pred_l, nids_l, dist_l
+
+    n = min(len(pred_l), len(pred_u))
+    prediction = (1.0 - w_upper) * pred_l[:n] + w_upper * pred_u[:n]
+    # Report neighbour info from whichever stage dominates the blend.
+    if w_upper >= 0.5:
+        return prediction, nids_u, dist_u
+    return prediction, nids_l, dist_l
+
+
+def _blend_spec(current_step: int, config) -> Optional[Tuple[int, float]]:
+    """Return ``(boundary, w_upper)`` if ``current_step`` is within the blend
+    half-width of a stage boundary, else ``None``.
+
+    ``w_upper`` ramps linearly 0->1 across ``[boundary - hw, boundary + hw)``,
+    so the prediction is all-lower-stage at ``boundary - hw`` and
+    all-upper-stage at ``boundary + hw``, with a 50/50 split exactly at the
+    boundary. The nearest boundary wins if windows ever overlap.
+    """
+    hw = config.stage_blend_halfwidth
+    if hw <= 0:
+        return None
+    best = None
+    for b in (config.early_stage_end, config.mid_stage_end):
+        if b - hw <= current_step < b + hw:
+            dist = abs(current_step - b)
+            if best is None or dist < best[0]:
+                w = (current_step - (b - hw)) / (2.0 * hw)
+                best = (dist, b, min(1.0, max(0.0, w)))
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def _predict_for_stage(
@@ -179,6 +229,11 @@ def _predict_for_stage(
         raise ValueError(f"No valid historical partial trajectories for step {current_step}")
 
     logging.info(f"Latest score value for current idol: {current_scores_for_search[-1]}")
+    # Soft (kernel-weighted) blending: pull a larger neighbour pool so distant
+    # neighbours can be faded out smoothly rather than dropped at the rank-k
+    # cliff. 0 => classic hard top-k.
+    bw_k = getattr(config, "soft_knn_bandwidth_k", 0)
+    pool_k = 3 * bw_k if bw_k > 0 else None
     distances, neighbor_ids = find_nearest_neighbors(
         current_partial=np.array(current_scores_for_search),
         candidate_partials=[c[:current_step] for c in candidate_partials],
@@ -191,7 +246,23 @@ def _predict_for_stage(
         sub_types=sub_types,
         border=border,
         slope_weight=stage.slope_weight,
+        target_idol_id=idol_id,
+        same_idol_distance_factor=config.same_idol_distance_factor,
+        pool_k=pool_k,
     )
+
+    # Gaussian-kernel neighbour weights with bandwidth = the bw_k-th neighbour's
+    # distance. A neighbour's weight then decays smoothly toward zero as it
+    # recedes, so crossing the pool boundary between steps costs ~nothing. None
+    # => let the alignment use its classic inverse-distance weighting.
+    soft_weights = None
+    if bw_k > 0 and len(distances) > 0:
+        h = float(distances[min(bw_k, len(distances)) - 1])
+        if h > 0 and np.isfinite(h):
+            w = np.exp(-0.5 * (np.asarray(distances, dtype=float) / h) ** 2)
+            total = w.sum()
+            if total > 0:
+                soft_weights = w / total
 
     if is_debug_logging():
         plot_current_and_neighbors(
@@ -222,6 +293,7 @@ def _predict_for_stage(
             scale_cap=stage.scale_cap,
             disable_scale=config.disable_scale,
             neighbor_ids=neighbor_ids,
+            weights=soft_weights,
         )
     else:
         prediction = single_method_predict(
@@ -235,6 +307,7 @@ def _predict_for_stage(
             scale_cap=stage.scale_cap,
             disable_scale=config.disable_scale,
             neighbor_ids=neighbor_ids,
+            weights=soft_weights,
         )
 
     if is_debug_logging():
