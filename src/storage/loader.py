@@ -135,6 +135,22 @@ def upload_predictions_to_r2(
     if snapshot_step is not None:
         logging.info(f"Also uploaded {snapshot_count} step-{snapshot_step} snapshot files under {prefix}prediction_history/{event_id}/")
 
+def _parse_jst(values):
+    """Parse timestamps that may carry mixed timezone offsets, as Asia/Tokyo.
+
+    The event/border CSVs mix offset styles (e.g. ``+09:00`` on some rows and
+    ``Z`` on others). Newer pandas raises ``ValueError: Mixed timezones`` unless
+    ``utc=True``. We parse to UTC (which accepts mixed offsets) and convert to
+    Asia/Tokyo, since every downstream comparison and wall-clock calculation in
+    this codebase assumes JST. ``errors='coerce'`` keeps NaT for bad/placeholder
+    values (e.g. out-of-range ``0001-01-01``). Works for Series and scalars.
+    """
+    dt = pd.to_datetime(values, errors='coerce', utc=True)
+    if hasattr(dt, 'dt'):          # Series
+        return dt.dt.tz_convert('Asia/Tokyo')
+    return dt.tz_convert('Asia/Tokyo')  # scalar Timestamp / NaT
+
+
 def _process_border_and_event_data(
     border_info: pd.DataFrame,
     event_info: pd.DataFrame,
@@ -143,12 +159,12 @@ def _process_border_and_event_data(
     event_id_range: Tuple[int, int] = (0, 1000),
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
-    border_info['aggregated_at'] = pd.to_datetime(border_info['aggregated_at'])
+    border_info['aggregated_at'] = _parse_jst(border_info['aggregated_at'])
     mask = event_info['boost_at'] == '0001-01-01T00:00:00Z'
     event_info.loc[mask, 'boost_at'] = event_info.loc[mask, 'end_at']
-    event_info['start_at'] = pd.to_datetime(event_info['start_at'])
-    event_info['end_at'] = pd.to_datetime(event_info['end_at']) + pd.Timedelta(seconds=1)
-    event_info['boost_at'] = pd.to_datetime(event_info['boost_at'])
+    event_info['start_at'] = _parse_jst(event_info['start_at'])
+    event_info['end_at'] = _parse_jst(event_info['end_at']) + pd.Timedelta(seconds=1)
+    event_info['boost_at'] = _parse_jst(event_info['boost_at'])
 
     # Add border info for the start time
     earliest_rows = border_info.sort_values('aggregated_at').groupby(['event_id', 'border']).first().reset_index()
@@ -191,17 +207,17 @@ def _process_anniversary_data(
     # Make a copy to avoid SettingWithCopyWarning
     event_info = event_info.copy()
     
-    event_info['start_at'] = pd.to_datetime(event_info['start_at'])
-    event_info['start_date'] = pd.to_datetime(event_info['start_at']).dt.date
-    event_info['end_at'] = pd.to_datetime(event_info['end_at']) + pd.Timedelta(seconds=1)
-    event_info['boost_at'] = pd.to_datetime(event_info['boost_at'], errors='coerce')
+    event_info['start_at'] = _parse_jst(event_info['start_at'])
+    event_info['start_date'] = event_info['start_at'].dt.date
+    event_info['end_at'] = _parse_jst(event_info['end_at']) + pd.Timedelta(seconds=1)
+    event_info['boost_at'] = _parse_jst(event_info['boost_at'])
     
     latest_valid_date = pd.Timestamp('2010-01-01', tz='Asia/Tokyo')
     valid_mask = (~event_info['boost_at'].isna()) & (event_info['boost_at'] > latest_valid_date)
     valid_event_info = event_info[valid_mask]
     
     if not border_info.empty:
-        border_info['aggregated_at'] = pd.to_datetime(border_info['aggregated_at'])
+        border_info['aggregated_at'] = _parse_jst(border_info['aggregated_at'])
         
         # Add start time rows
         start_time_rows = []
@@ -387,7 +403,7 @@ def load_anniversary_data_from_r2(
     event_info = pd.read_csv(StringIO(event_obj['Body'].read().decode('utf-8')))
     event_ids = event_info[event_info['event_type'] == 5]['event_id'].unique()
 
-    event_info['boost_at'] = pd.to_datetime(event_info['boost_at'], errors='coerce')
+    event_info['boost_at'] = _parse_jst(event_info['boost_at'])
     latest_valid_date = pd.Timestamp('2010-01-01', tz='Asia/Tokyo')
     valid_mask = (~event_info['boost_at'].isna()) & (event_info['boost_at'] > latest_valid_date)
     valid_event_info = event_info[valid_mask]
@@ -498,9 +514,9 @@ def get_len_and_boost_ratio(event_info: pd.DataFrame, idol_ids: List[int]) -> Di
     for event_id in event_info['event_id'].unique():
         edf = event_info[event_info['event_id'] == event_id]
         if len(edf) > 0:
-            start_at = pd.to_datetime(edf.iloc[0]['start_at'])
-            end_at = pd.to_datetime(edf.iloc[0]['end_at'])
-            boost_at = pd.to_datetime(edf.iloc[0]['boost_at'])
+            start_at = _parse_jst(edf.iloc[0]['start_at'])
+            end_at = _parse_jst(edf.iloc[0]['end_at'])
+            boost_at = _parse_jst(edf.iloc[0]['boost_at'])
             # Calculate length in 30-min steps (+1 for inclusive)
             length = int(((end_at - start_at).total_seconds() / 1800) + 1)
             # Calculate boost ratio
