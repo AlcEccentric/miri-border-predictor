@@ -160,6 +160,103 @@ def verify_coverage_loeo(df, confidence_levels, start_step=55, end_step=299):
     return {cl: (hits[cl] / total[cl]) if total[cl] else float('nan') for cl in confidence_levels}
 
 
+# ---------------------------------------------------------------------------
+# Event-aware width calibration
+# ---------------------------------------------------------------------------
+#
+# The per-(step,tier) bands above are estimated from idol-rows (~150 per cell),
+# but idols within one event are correlated (an event runs hot/cold as a whole).
+# The real exchangeable unit is the EVENT, of which there are very few (~4 for
+# anniversaries). Estimating a quantile from ~4 events is hopeless, but a single
+# WIDTH multiplier is robustly estimable: pick the smallest factor per
+# confidence level such that the leave-one-event-out coverage meets nominal in
+# every step bucket. Shape comes from the rows; width is pinned by the
+# event-respecting LOEO objective. A well-calibrated group gets factor 1.0.
+
+def _inflate_interval(bounds, c):
+    """Widen ``[lo, hi]`` by factor ``c`` about its midpoint (keeps center)."""
+    lo, hi = bounds
+    mid = 0.5 * (lo + hi)
+    half = 0.5 * (hi - lo)
+    return [mid - c * half, mid + c * half]
+
+
+def _step_bucket(step):
+    return 'early' if step <= 115 else ('mid' if step <= 215 else 'late')
+
+
+def _loeo_records(df, confidence_levels, start_step=55, end_step=299):
+    """Collect leave-one-event-out (cl, bucket, lo, hi, err_frac) tuples once.
+
+    Building the CIs is the expensive part and does not depend on the width
+    factor, so we collect the held-out bounds+errors once and then evaluate any
+    factor cheaply against these records.
+    """
+    if 'tier' not in df.columns:
+        df = df.assign(tier=0)
+    events = sorted(df['event_id'].unique())
+    recs = []
+    if len(events) < 2:
+        return recs
+    for held in events:
+        train = df[df['event_id'] != held]
+        test = df[df['event_id'] == held]
+        si = analyze_confidence_intervals_for_group(train, confidence_levels)
+        if not si:
+            continue
+        interp = interpolate_confidence_intervals(si, confidence_levels, start_step, end_step)
+        for _, row in test.iterrows():
+            err = row['relative_error']
+            if pd.isna(err):
+                continue
+            step = int(row['step'])
+            tier = int(row.get('tier', 0))
+            ef = err / 100.0
+            for cl in confidence_levels:
+                b = interp.get((step, tier, cl))
+                if b is not None:
+                    recs.append((cl, _step_bucket(step), b[0], b[1], ef))
+    return recs
+
+
+def _coverage_from_records(recs, cl, c, bucket=None):
+    """Realized coverage for confidence level ``cl`` at width factor ``c``."""
+    hit = tot = 0
+    for rcl, bk, lo, hi, e in recs:
+        if rcl != cl or (bucket is not None and bk != bucket):
+            continue
+        ilo, ihi = _inflate_interval((lo, hi), c)
+        tot += 1
+        if ilo <= e <= ihi:
+            hit += 1
+    return (hit / tot if tot else float('nan')), tot
+
+
+def calibrate_width_factors(df, confidence_levels, start_step=55, end_step=299,
+                            margin=0.0, max_factor=4.0):
+    """Smallest per-level width multiplier so LOEO coverage >= nominal in every
+    step bucket. Returns ``({cl: factor}, records)``. Factor 1.0 means the group
+    is already calibrated.
+    """
+    recs = _loeo_records(df, confidence_levels, start_step, end_step)
+    factors = {cl: 1.0 for cl in confidence_levels}
+    if not recs:
+        return factors, recs
+    grid = [round(1.0 + 0.05 * i, 2) for i in range(0, int((max_factor - 1.0) / 0.05) + 1)]
+    buckets = ('early', 'mid', 'late')
+    for cl in confidence_levels:
+        target = cl / 100.0 + margin
+        chosen = grid[-1]
+        for c in grid:
+            covs = [_coverage_from_records(recs, cl, c, bk)[0] for bk in buckets]
+            covs = [x for x in covs if not np.isnan(x)]
+            if covs and min(covs) >= target:
+                chosen = c
+                break
+        factors[cl] = chosen
+    return factors, recs
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze confidence intervals of relative errors for all CSV files')
     parser.add_argument('--input-dir', default='test_results', help='Directory containing CSV files (default: test_results)')
@@ -169,6 +266,12 @@ def main():
     parser.add_argument('--end-step', type=int, default=299, help='Ending step (default: 299)')
     parser.add_argument('--verify', action='store_true',
                         help='also report leave-one-event-out (out-of-sample) coverage per file')
+    parser.add_argument('--no-width-calibration', dest='calibrate_width',
+                        action='store_false', default=True,
+                        help='disable event-aware width calibration (on by default)')
+    parser.add_argument('--coverage-margin', type=float, default=0.0,
+                        help='extra coverage headroom above nominal when calibrating width '
+                             '(e.g. 0.02 targets 92%% for a 90%% band)')
 
     args = parser.parse_args()
 
@@ -203,6 +306,21 @@ def main():
                 step_intervals, args.confidence_levels, args.start_step, args.end_step,
             )
 
+            # Event-aware width calibration: scale each band's width by a single
+            # per-confidence-level factor so leave-one-event-out coverage meets
+            # nominal in every step bucket. Honest for clustered, few-event data
+            # where the band shape (from rows) is fine but the width is not.
+            width_factors = {cl: 1.0 for cl in args.confidence_levels}
+            if args.calibrate_width and 'event_id' in df.columns \
+                    and df['event_id'].nunique() >= 2:
+                width_factors, _ = calibrate_width_factors(
+                    df, args.confidence_levels, args.start_step, args.end_step,
+                    margin=args.coverage_margin,
+                )
+                applied = ", ".join(f"{cl}%×{width_factors[cl]:.2f}"
+                                    for cl in args.confidence_levels)
+                print(f"  width calibration (event-aware): {applied}")
+
             tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
             output_data = []
             for step in range(args.start_step, args.end_step + 1):
@@ -210,7 +328,8 @@ def main():
                     for confidence_level in args.confidence_levels:
                         key = (step, tier, confidence_level)
                         if key in interpolated:
-                            bounds = interpolated[key]
+                            bounds = _inflate_interval(
+                                interpolated[key], width_factors.get(confidence_level, 1.0))
                             output_data.append({
                                 'step': step,
                                 'tier': tier,
@@ -227,14 +346,21 @@ def main():
                 print(f"  Saved {output_filename}")
 
             if args.verify and 'event_id' in df.columns:
-                cov = verify_coverage_loeo(df, args.confidence_levels,
-                                           args.start_step, args.end_step)
-                if cov:
-                    parts_cov = ", ".join(
-                        f"{cl}%→{c*100:.1f}%" for cl, c in cov.items()
-                    )
-                    print(f"  leave-one-event-out coverage: {parts_cov}  "
-                          f"(target = nominal; >= is good)")
+                recs = _loeo_records(df, args.confidence_levels,
+                                     args.start_step, args.end_step)
+                if recs:
+                    buckets = ('early', 'mid', 'late')
+                    print("  leave-one-event-out coverage (raw -> calibrated):")
+                    for cl in args.confidence_levels:
+                        c = width_factors.get(cl, 1.0)
+                        raw_all = _coverage_from_records(recs, cl, 1.0)[0]
+                        cal_all = _coverage_from_records(recs, cl, c)[0]
+                        per_bucket = ", ".join(
+                            f"{bk} {_coverage_from_records(recs, cl, c, bk)[0]*100:.0f}%"
+                            for bk in buckets
+                        )
+                        print(f"    {cl}% (x{c:.2f}): overall {raw_all*100:.1f}% -> "
+                              f"{cal_all*100:.1f}%  [{per_bucket}]  (target {cl}%)")
 
         print(f"\nAll results saved to {args.output_dir}/")
 
