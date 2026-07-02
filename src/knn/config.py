@@ -464,6 +464,16 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
             AlignmentMethod.AFFINE: 0.0,
             AlignmentMethod.LINEAR: 0.0
         },
+        # Enabled after backtesting on 6 anniversary events (142/192/241/
+        # 290/339/388): fixes surge-driven over-prediction (e.g. idol45/437,
+        # ~34% inflated) by making neighbour search scale-invariant across
+        # events. Early stage consistently improves; mid stage has a small
+        # universal cost (worst single step +0.52pp MAE, worst pooled +0.28pp
+        # per event); late stage is flat on MAE with a minor cov5% cost. Net
+        # accepted as a tradeoff -- see TODO.md / commit history for detail.
+        early_stage_use_relative_scale_for_search=True,
+        mid_stage_use_relative_scale_for_search=True,
+        late_stage_use_relative_scale_for_search=True,
     )
 
 
