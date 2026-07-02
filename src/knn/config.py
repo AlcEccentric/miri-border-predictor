@@ -100,6 +100,83 @@ class GroupConfig:
     mid_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
     late_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
 
+    # Penalize candidates whose within-event standing (percentile rank among
+    # idols in their own event, 0=best/highest score, 1=worst) differs a lot
+    # from the target's own within-event standing at the same step. Distance
+    # is multiplied by (1 + weight * |own_percentile - candidate_percentile|).
+    # Motivated by anniversary events: a transient scoring-rate surge can
+    # make a mid-pack idol's absolute trajectory shape resemble an ELITE
+    # idol's trajectory from a calmer historical event, producing
+    # systematically too-elite neighbour matches. 0.0 = off (no behaviour
+    # change vs. before this field existed).
+    early_stage_rank_gap_weight: float = 0.0
+    mid_stage_rank_gap_weight: float = 0.0
+    late_stage_rank_gap_weight: float = 0.0
+
+    # Adaptive gating for the rank-gap penalty above. ``None`` (default) =
+    # unconditional: whenever ``*_rank_gap_weight`` > 0, the penalty always
+    # applies (the original, non-adaptive behaviour). When set to a float,
+    # the penalty is applied to an idol/step ONLY if a first (unweighted)
+    # neighbour search already shows a rank-gap larger than this threshold
+    # for the PROVISIONAL top-k -- i.e. only when that idol currently looks
+    # mismatched. This avoids penalising idol/steps that aren't actually
+    # mismatched (backtesting showed the unconditional penalty could hurt
+    # accuracy right around the early/mid stage boundary).
+    early_stage_rank_gap_threshold: Optional[float] = None
+    mid_stage_rank_gap_threshold: Optional[float] = None
+    late_stage_rank_gap_threshold: Optional[float] = None
+
+    # Categorical alternative to ``*_rank_gap_weight``. When set (and the
+    # adaptive gate above fires, i.e. the provisional pool already looks
+    # mismatched), candidates whose OWN rank-gap exceeds this value are
+    # excluded from the pool entirely rather than having their distance
+    # scaled by a weight. This avoids the severity-calibration problem a
+    # multiplicative weight has: a fixed weight tuned against a mild
+    # mismatch (e.g. a normal event) can be far too weak to matter for a
+    # severe one (e.g. an event-wide surge), or too aggressive for the mild
+    # case if tuned against the severe one. A hard cutoff is calibration-free
+    # in that sense -- it always removes a badly-mismatched candidate,
+    # regardless of how large the mismatch is. ``None`` = off (no behaviour
+    # change; falls back to the weight-based penalty if that is set).
+    early_stage_rank_gap_max_gap: Optional[float] = None
+    mid_stage_rank_gap_max_gap: Optional[float] = None
+    late_stage_rank_gap_max_gap: Optional[float] = None
+
+    # Severity-adaptive alternative to a fixed ``*_rank_gap_weight``. Instead
+    # of a constant multiplier tuned against one historical event's mismatch
+    # severity (which may be far too weak or far too strong for a different
+    # event -- e.g. a normal year's mild mismatch vs. an event-wide surge's
+    # severe one), the effective weight is derived AT PREDICTION TIME from
+    # how bad the mismatch actually looks for this idol/step:
+    #
+    #     effective_weight = (target_inflation - 1) / mean_provisional_gap
+    #
+    # where ``mean_provisional_gap`` is the same quantity already computed
+    # for the adaptive gate (mean rank-gap of the unweighted top-k). This
+    # means a "typical" mismatched candidate in the pool always ends up with
+    # its distance multiplied by approximately ``target_inflation``,
+    # regardless of whether the underlying mismatch is mild or severe --
+    # the correction strength is calibrated by the current event's own
+    # measured severity, not by history. ``None`` = off (falls back to
+    # ``*_rank_gap_weight`` if set, else no correction).
+    early_stage_rank_gap_target_inflation: Optional[float] = None
+    mid_stage_rank_gap_target_inflation: Optional[float] = None
+    late_stage_rank_gap_target_inflation: Optional[float] = None
+
+    # When True, neighbour SEARCH (distance computation only -- not
+    # alignment/prediction, which stay on raw scores) divides every idol's
+    # trajectory by its own event's contemporaneous scale (median score
+    # across idols in that event, at each step) before computing distances.
+    # This makes trajectories from differently-inflated events comparable,
+    # fixing the root cause of a scoring-rate surge making a mid-pack idol's
+    # absolute curve resemble an elite idol's curve from a calmer year --
+    # rather than the rank-gap fields above, which penalise/exclude
+    # already-mismatched candidates after the (biased) distance is computed.
+    # False (default) = off, no behaviour change.
+    early_stage_use_relative_scale_for_search: bool = False
+    mid_stage_use_relative_scale_for_search: bool = False
+    late_stage_use_relative_scale_for_search: bool = False
+
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
     late_stage_use_ensemble: bool = False

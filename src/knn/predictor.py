@@ -39,7 +39,7 @@ from src.knn.alignment import (
     single_method_predict,
 )
 from src.knn.config import AlignmentMethod, get_group_config
-from src.knn.distance import build_candidate_set, find_nearest_neighbors
+from src.knn.distance import build_candidate_set, find_nearest_neighbors, to_relative_trajectory
 from src.knn.plotting import (
     is_debug_logging,
     plot_current_and_neighbors,
@@ -205,8 +205,10 @@ def _predict_for_stage(
     # pool is identical across idols of the same event/step, so a caller-
     # supplied cache avoids rebuilding it 52x for anniversary events. The
     # key includes use_smooth_for_neighbors because the search dataframe (and
-    # thus the pool) differs between stages that smooth and those that don't.
-    cache_key = (event_id, current_step, stage.use_smooth_for_neighbors)
+    # thus the pool) differs between stages that smooth and those that don't;
+    # use_smooth_for_prediction is included too since the completeness gate
+    # below now filters against prediction_full_df, which also depends on it.
+    cache_key = (event_id, current_step, stage.use_smooth_for_neighbors, stage.use_smooth_for_prediction)
     if candidate_cache is not None and cache_key in candidate_cache:
         candidate_partials, candidate_ids = candidate_cache[cache_key]
     else:
@@ -222,6 +224,10 @@ def _predict_for_stage(
             # producing predictions inflated by ~1000x for type 5 low-popularity
             # idols at small borders.
             min_score_at_step=1.0,
+            # Completeness gate: a candidate must also have a full trajectory,
+            # so a still-live event's partial data (present in search_df, but
+            # with no complete future) can never be selected as a neighbour.
+            full_df=sources.prediction_full_df,
         )
         if candidate_cache is not None:
             candidate_cache[cache_key] = (candidate_partials, candidate_ids)
@@ -229,14 +235,32 @@ def _predict_for_stage(
         raise ValueError(f"No valid historical partial trajectories for step {current_step}")
 
     logging.info(f"Latest score value for current idol: {current_scores_for_search[-1]}")
+
+    # Make trajectories from differently-inflated events comparable in the
+    # SEARCH (distance) space only -- divide each trajectory by its own
+    # event's contemporaneous scale (median score across idols in that
+    # event) at current_step, a single scalar reference value (not an
+    # elementwise per-step division, which would distort each trajectory's
+    # own shape within the lookback window). Prediction/alignment continue
+    # to use the raw (non-rescaled) trajectories fetched later via
+    # fetch_neighbor_trajectories.
+    search_current = np.array(current_scores_for_search)
+    search_candidates = [c[:current_step] for c in candidate_partials]
+    if getattr(stage, "use_relative_scale_for_search", False):
+        search_current = to_relative_trajectory(search_current, event_id, sources.search_partial_df)
+        search_candidates = [
+            to_relative_trajectory(c, float(cid[0]), sources.search_partial_df)
+            for c, cid in zip(search_candidates, candidate_ids)
+        ]
+
     # Soft (kernel-weighted) blending: pull a larger neighbour pool so distant
     # neighbours can be faded out smoothly rather than dropped at the rank-k
     # cliff. 0 => classic hard top-k.
     bw_k = getattr(config, "soft_knn_bandwidth_k", 0)
     pool_k = 3 * bw_k if bw_k > 0 else None
     distances, neighbor_ids = find_nearest_neighbors(
-        current_partial=np.array(current_scores_for_search),
-        candidate_partials=[c[:current_step] for c in candidate_partials],
+        current_partial=search_current,
+        candidate_partials=search_candidates,
         candidate_ids=candidate_ids,
         current_step=current_step,
         k=stage.k,
@@ -249,6 +273,12 @@ def _predict_for_stage(
         target_idol_id=idol_id,
         same_idol_distance_factor=config.same_idol_distance_factor,
         pool_k=pool_k,
+        rank_gap_weight=getattr(stage, "rank_gap_weight", 0.0),
+        search_df=sources.search_partial_df,
+        target_event_id=event_id,
+        rank_gap_threshold=getattr(stage, "rank_gap_threshold", None),
+        rank_gap_max_gap=getattr(stage, "rank_gap_max_gap", None),
+        rank_gap_target_inflation=getattr(stage, "rank_gap_target_inflation", None),
     )
 
     # Gaussian-kernel neighbour weights with bandwidth = the bw_k-th neighbour's

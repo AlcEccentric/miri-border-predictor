@@ -15,7 +15,9 @@ Candidate assembly (``build_candidate_set``) also lives here since it is
 the input side of this pipeline.
 """
 
-from typing import List, Tuple
+import threading
+import weakref
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,6 +26,156 @@ from scipy.spatial.distance import cdist
 from src.knn.config import DistanceMetric, get_group_config
 
 NeighbourId = Tuple[float, float]  # (event_id, idol_id)
+
+
+# ---------------------------------------------------------------------------
+# Within-event percentile rank (for the rank-gap distance penalty)
+# ---------------------------------------------------------------------------
+
+# Keyed by (id(search_df), event_id, step) -> {idol_id: percentile}.
+# Same weak-reference eviction pattern as stage.py's ``_scores_cache`` so
+# entries disappear once the underlying dataframe is garbage collected.
+_percentile_cache: Dict[Tuple[int, float, int], Dict[float, float]] = {}
+_percentile_cache_lock = threading.Lock()
+
+
+def compute_event_percentiles(
+    search_df: pd.DataFrame, event_id: float, step: int
+) -> Dict[float, float]:
+    """Percentile rank of each idol within ``event_id`` at ``step``.
+
+    ``0.0`` = highest score (best) in the event at that step, ``1.0`` = worst.
+    Idols whose trajectory is shorter than ``step`` are omitted. Used by the
+    rank-gap distance penalty (see ``find_nearest_neighbors``) to detect when
+    a candidate's absolute-score shape match is misleading because the
+    candidate was a much more (or less) elite idol within its own event than
+    the target currently is within its own event -- e.g. a transient
+    scoring-rate surge can push a mid-pack idol's absolute trajectory into
+    the range only elite idols reach in calmer historical events.
+    """
+    from src.knn.stage import scores_of
+
+    cache_key = (id(search_df), float(event_id), int(step))
+    cached = _percentile_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    with _percentile_cache_lock:
+        cached = _percentile_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        sub = search_df[search_df["event_id"] == event_id]
+        idols = sub["idol_id"].unique()
+        scores: Dict[float, float] = {}
+        for iid in idols:
+            arr = scores_of(search_df, event_id, iid)
+            if len(arr) >= step and step > 0:
+                scores[float(iid)] = float(arr[step - 1])
+        if not scores:
+            result: Dict[float, float] = {}
+        else:
+            ordered = sorted(scores.items(), key=lambda kv: -kv[1])
+            n = len(ordered)
+            result = {iid: rank / (n - 1) if n > 1 else 0.0
+                      for rank, (iid, _) in enumerate(ordered)}
+        _percentile_cache[cache_key] = result
+        weakref.finalize(search_df, _percentile_cache.pop, cache_key, None)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Contemporaneous event-scale normalization (for the distance/search space)
+# ---------------------------------------------------------------------------
+
+# Keyed by (id(search_df), event_id) -> per-step scale array. Same
+# weak-reference eviction pattern as the percentile cache above.
+_event_scale_cache: Dict[Tuple[int, float], np.ndarray] = {}
+_event_scale_cache_lock = threading.Lock()
+
+
+def compute_event_scale_series(
+    search_df: pd.DataFrame, event_id: float, min_score: float = 1.0
+) -> np.ndarray:
+    """Per-step scale (median score across idols) for ``event_id``.
+
+    Used to make trajectories from different events comparable in the
+    neighbour-search distance space even when one event is running at a
+    globally higher or lower pace than another (e.g. a scoring-rate surge
+    that inflates every idol's absolute score, not just one). Dividing each
+    idol's raw score by its own event's contemporaneous scale removes that
+    shared, event-wide magnitude shift while preserving each idol's
+    *relative* position within their event -- which is what the shape
+    distance is meant to compare in the first place.
+
+    Recomputed fresh from the population at every step (not fit to a
+    parametric decay curve), so a time-varying inflation factor (e.g. a
+    front-loaded surge that fades) is tracked automatically without any
+    extra modelling.
+
+    Idols whose score at a step is below ``min_score`` (not yet
+    meaningfully started) are excluded from that step's median so early
+    steps aren't dragged toward zero by not-yet-active idols. Any leading
+    steps where nobody has started yet are back-filled with the first valid
+    value.
+    """
+    from src.knn.stage import scores_of
+
+    cache_key = (id(search_df), float(event_id))
+    cached = _event_scale_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    with _event_scale_cache_lock:
+        cached = _event_scale_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        idol_ids = search_df.loc[search_df["event_id"] == event_id, "idol_id"].unique()
+        trajectories = [scores_of(search_df, event_id, iid) for iid in idol_ids]
+        trajectories = [t for t in trajectories if len(t) > 0]
+        if not trajectories:
+            result = np.array([1.0])
+        else:
+            max_len = max(len(t) for t in trajectories)
+            scale = np.full(max_len, np.nan)
+            for t in range(max_len):
+                vals = [traj[t] for traj in trajectories if len(traj) > t and traj[t] >= min_score]
+                if vals:
+                    scale[t] = np.median(vals)
+            filled = pd.Series(scale).bfill().ffill()
+            result = filled.to_numpy()
+            # Guard against a pathological all-zero/NaN step (shouldn't
+            # happen once back/forward-filled, but keeps division safe).
+            result = np.where((result > 0) & np.isfinite(result), result, 1.0)
+        _event_scale_cache[cache_key] = result
+        weakref.finalize(search_df, _event_scale_cache.pop, cache_key, None)
+        return result
+
+
+def to_relative_trajectory(
+    arr: np.ndarray, event_id: float, search_df: pd.DataFrame, min_score: float = 1.0,
+    ref_step: Optional[int] = None,
+) -> np.ndarray:
+    """Divide ``arr`` (a raw score trajectory from ``event_id``) by a SINGLE
+    scalar reference value: that event's own contemporaneous scale
+    (``compute_event_scale_series``) at ``ref_step`` (default: the last index
+    of ``arr``, i.e. "now" for whichever trajectory is passed in).
+
+    Deliberately a single scalar, not an elementwise division by the whole
+    per-step scale series. Dividing point-by-point by a moving scale(t)
+    removes the between-event LEVEL difference but also distorts each
+    trajectory's own SHAPE within the lookback window (the scale itself
+    drifts over the window, which changes the effective slope) -- this
+    showed up empirically as a regression on ordinary (non-surging) events,
+    where there was no real cross-event mismatch to correct in the first
+    place. Dividing by one fixed value removes only the level difference and
+    leaves each trajectory's internal dynamics untouched, which both fixed
+    that regression AND strengthened the correction on the surging event it
+    was designed for (mismatched candidates separate more cleanly once
+    within-window shape noise is removed).
+    """
+    scale = compute_event_scale_series(search_df, event_id, min_score)
+    idx = (len(arr) - 1) if ref_step is None else (ref_step - 1)
+    idx = max(0, min(idx, len(scale) - 1))
+    ref = scale[idx]
+    return arr / ref if ref > 0 else arr
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +286,7 @@ def build_candidate_set(
     current_step: int,
     min_event_id: float,
     min_score_at_step: float = 0.0,
+    full_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[List[np.ndarray], List[NeighbourId]]:
     """Collect historical (event, idol) trajectories eligible as neighbours.
 
@@ -145,12 +298,31 @@ def build_candidate_set(
     The score gate mirrors the target-side ``MIN_CURRENT_SCORE`` check so
     "not yet started" candidates (flat-zero in the lookback window, which
     arbitrarily match low-magnitude targets by shape) don't enter the pool.
+
+    ``full_df`` (typically the caller's ``prediction_full_df``, which is
+    expected to exclude any still-in-progress event) is used as a
+    completeness gate when supplied: a candidate is also required to have a
+    trajectory present there, so a still-live event's partial data --
+    present in ``search_df`` because the search space legitimately needs it
+    to find matches against, but with no COMPLETE future to predict from --
+    can never be selected as a neighbour. Without this, a neighbour with an
+    empty "full" trajectory later crashes prediction/alignment (which reads
+    ``full[-1]``); with a raw-score distance metric this was rare enough to
+    go unnoticed, but relative/normalised distance spaces make it far more
+    likely for an incomplete event's shape to look deceptively close.
     """
     historical = search_df[search_df["event_id"] != exclude_event_id]
+    complete_ids = None
+    if full_df is not None:
+        complete_ids = set(
+            map(tuple, full_df[["event_id", "idol_id"]].drop_duplicates().to_numpy())
+        )
     trajectories: List[np.ndarray] = []
     ids: List[NeighbourId] = []
     for (eid, iid), group in historical.groupby(["event_id", "idol_id"]):
         if eid < min_event_id:
+            continue
+        if complete_ids is not None and (eid, iid) not in complete_ids:
             continue
         scores = group["score"].values
         if len(scores) < current_step:
@@ -232,6 +404,12 @@ def find_nearest_neighbors(
     target_idol_id: float = None,
     same_idol_distance_factor: float = 1.0,
     pool_k: int = None,
+    rank_gap_weight: float = 0.0,
+    search_df: Optional[pd.DataFrame] = None,
+    target_event_id: Optional[float] = None,
+    rank_gap_threshold: Optional[float] = None,
+    rank_gap_max_gap: Optional[float] = None,
+    rank_gap_target_inflation: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return the top-k nearest neighbours and their distances.
 
@@ -242,6 +420,41 @@ def find_nearest_neighbors(
     If ``same_idol_distance_factor`` < 1.0 and ``target_idol_id`` is given,
     candidates sharing the target's idol_id have their distance multiplied by
     that factor, biasing selection toward the same idol across other events.
+
+    If ``rank_gap_weight`` > 0 (requires ``search_df`` and ``target_event_id``),
+    distance is multiplied by ``(1 + rank_gap_weight * |own_pctl - cand_pctl|)``
+    where ``*_pctl`` is each idol's within-event percentile rank (0=best) at
+    ``current_step``. Penalises candidates whose within-event standing is far
+    from the target's, independent of both trajectories' absolute scale --
+    see ``compute_event_percentiles``. 0.0 = off (no behaviour change).
+
+    If ``rank_gap_threshold`` is also given, the correction is ADAPTIVE: a
+    provisional (unweighted) top-k is selected first, and the mean rank-gap
+    of that provisional set is compared to the threshold. The correction is
+    only applied if the provisional set already looks mismatched (gap >
+    threshold); otherwise the provisional, unweighted result is returned
+    unchanged. This confines the correction to idol/steps that actually show
+    the mismatch, rather than applying it unconditionally to every
+    prediction.
+
+    If ``rank_gap_max_gap`` is given, the correction is CATEGORICAL instead
+    of magnitude-scaled: any candidate whose own rank-gap exceeds this value
+    is dropped from the pool entirely (as long as enough candidates remain
+    to fill ``k``), rather than having its distance multiplied by
+    ``rank_gap_weight``. ``rank_gap_max_gap`` takes precedence over
+    ``rank_gap_weight`` / ``rank_gap_target_inflation`` when set.
+
+    If ``rank_gap_target_inflation`` is given (and ``rank_gap_max_gap`` is
+    not), the effective weight is derived from the CURRENT mismatch severity
+    instead of being a fixed constant:
+        effective_weight = (rank_gap_target_inflation - 1) / mean(provisional_gaps)
+    so a "typical" mismatched candidate in the provisional top-k ends up with
+    its distance multiplied by approximately ``rank_gap_target_inflation``,
+    whether the underlying mismatch this event/step is mild or severe. This
+    avoids calibrating a fixed weight against one historical event's
+    severity and having it be far too weak (or too aggressive) for a
+    different event with a differently-sized mismatch. Takes precedence over
+    a plain ``rank_gap_weight`` when set.
 
     ``pool_k`` overrides how many neighbours are returned (default ``k``). Soft
     (kernel-weighted) callers pass a larger pool so the caller can fade distant
@@ -284,6 +497,66 @@ def find_nearest_neighbors(
     if same_idol_distance_factor != 1.0 and target_idol_id is not None and len(id_arr):
         same_idol = id_arr[:, 1] == target_idol_id
         distance_arr = distance_arr * np.where(same_idol, same_idol_distance_factor, 1.0)
+
+    # Penalise (or exclude) candidates whose within-event standing differs a
+    # lot from the target's own within-event standing, if requested.
+    use_categorical = rank_gap_max_gap is not None
+    use_severity_adaptive = rank_gap_target_inflation is not None
+    if (rank_gap_weight > 0 or use_categorical or use_severity_adaptive) and search_df is not None and target_event_id is not None and len(id_arr):
+        own_pctls = compute_event_percentiles(search_df, target_event_id, current_step)
+        own_pctl = own_pctls.get(float(target_idol_id)) if target_idol_id is not None else None
+        if own_pctl is not None:
+            event_pctl_cache: Dict[float, Dict[float, float]] = {}
+
+            def _gaps_for(order_ids: np.ndarray) -> np.ndarray:
+                out = np.zeros(len(order_ids))
+                for i, (eid, iid) in enumerate(order_ids):
+                    pctls = event_pctl_cache.get(eid)
+                    if pctls is None:
+                        pctls = compute_event_percentiles(search_df, eid, current_step)
+                        event_pctl_cache[eid] = pctls
+                    cand_pctl = pctls.get(float(iid))
+                    out[i] = abs(own_pctl - cand_pctl) if cand_pctl is not None else 0.0
+                return out
+
+            apply_correction = True
+            mean_provisional_gap = None
+            if rank_gap_threshold is not None or rank_gap_target_inflation is not None:
+                # Compute the PROVISIONAL (unweighted) top-k's mean gap once;
+                # used both for the adaptive gate and for severity-scaling
+                # the effective weight below.
+                k_provisional = min(pool_k if pool_k else k, len(distance_arr))
+                provisional_order = np.argsort(distance_arr)[:k_provisional]
+                provisional_gaps = _gaps_for(id_arr[provisional_order])
+                mean_provisional_gap = float(np.mean(provisional_gaps))
+                if rank_gap_threshold is not None:
+                    apply_correction = mean_provisional_gap > rank_gap_threshold
+
+            if apply_correction:
+                gaps = _gaps_for(id_arr)
+                if use_categorical:
+                    # Drop candidates over the cutoff, but only if enough
+                    # remain to fill k -- never shrink the pool below k.
+                    keep_mask = gaps <= rank_gap_max_gap
+                    if keep_mask.sum() >= min(pool_k if pool_k else k, len(distance_arr)):
+                        distance_arr = distance_arr[keep_mask]
+                        id_arr = id_arr[keep_mask]
+                else:
+                    effective_weight = rank_gap_weight
+                    if rank_gap_target_inflation is not None:
+                        # Derive the weight from the CURRENT event/step's own
+                        # measured severity, so a fixed constant never has to
+                        # be calibrated against how bad the mismatch happens
+                        # to be this time.
+                        if mean_provisional_gap is None:
+                            k_provisional = min(pool_k if pool_k else k, len(distance_arr))
+                            provisional_order = np.argsort(distance_arr)[:k_provisional]
+                            mean_provisional_gap = float(np.mean(_gaps_for(id_arr[provisional_order])))
+                        if mean_provisional_gap > 1e-9:
+                            effective_weight = (rank_gap_target_inflation - 1.0) / mean_provisional_gap
+                        else:
+                            effective_weight = 0.0
+                    distance_arr = distance_arr * (1.0 + effective_weight * gaps)
 
     k_effective = min(pool_k if pool_k else k, len(distance_arr))
     top_k_order = np.argsort(distance_arr)[:k_effective]

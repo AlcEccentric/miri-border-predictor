@@ -39,6 +39,11 @@ class StageParams:
     use_smooth_for_prediction: bool
     scale_cap: Tuple[float, float]
     slope_weight: float
+    rank_gap_weight: float
+    rank_gap_threshold: Optional[float]
+    rank_gap_max_gap: Optional[float]
+    rank_gap_target_inflation: Optional[float]
+    use_relative_scale_for_search: bool
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -61,6 +66,11 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         use_smooth_for_prediction=getattr(config, f"{stage}_stage_use_smooth_for_prediction"),
         scale_cap=getattr(config, f"{stage}_stage_scale_cap"),
         slope_weight=getattr(config, f"{stage}_stage_slope_weight"),
+        rank_gap_weight=getattr(config, f"{stage}_stage_rank_gap_weight", 0.0),
+        rank_gap_threshold=getattr(config, f"{stage}_stage_rank_gap_threshold", None),
+        rank_gap_max_gap=getattr(config, f"{stage}_stage_rank_gap_max_gap", None),
+        rank_gap_target_inflation=getattr(config, f"{stage}_stage_rank_gap_target_inflation", None),
+        use_relative_scale_for_search=getattr(config, f"{stage}_stage_use_relative_scale_for_search", False),
     )
 
 
