@@ -177,6 +177,137 @@ class GroupConfig:
     mid_stage_use_relative_scale_for_search: bool = False
     late_stage_use_relative_scale_for_search: bool = False
 
+    # Adaptive scale cap: instead of a fixed per-stage scale_cap bound,
+    # loosen ONLY the bound in the direction a live, measured ratio points
+    # for THIS idol -- direction-agnostic (works for both inflation and
+    # deflation, no per-border branching needed):
+    #   - rank this idol's popularity position among other idols in the
+    #     current live event, using its average score over a trailing
+    #     window (`adaptive_cap_rank_window` steps) -- NOT cumulative
+    #     growth, which is dominated by the single latest point and would
+    #     reintroduce single-point ranking instability.
+    #   - find the same popularity position (+/- `adaptive_cap_half_width`,
+    #     clipped at the edges, never extended) in recent complete
+    #     historical events.
+    #   - ratio = this idol's cumulative growth (score_now - score_at_step_0)
+    #     / mean across historical events of their matched idols' pooled
+    #     cumulative growth over the same window. Cumulative (not trailing)
+    #     is used here specifically because it was empirically ~3x more
+    #     stable across successive prediction runs than a trailing-window
+    #     growth delta.
+    #   - if ratio > 1: new upper bound = max(static_upper, ratio).
+    #     if ratio < 1: new lower bound = min(static_lower, ratio).
+    #     Only ever loosens a bound, never tightens.
+    # Falls back to the static scale_cap unchanged if there isn't enough
+    # reliable data (too few historical events/idols, target idol's own
+    # data too short/degenerate). False (default) = off, no behaviour change.
+    early_stage_use_adaptive_scale_cap: bool = False
+    mid_stage_use_adaptive_scale_cap: bool = False
+    late_stage_use_adaptive_scale_cap: bool = False
+
+    # Trailing window (in normalized steps) used ONLY to rank idols by
+    # current popularity/standing -- see note above on why this must be a
+    # trailing average, not cumulative growth.
+    early_stage_adaptive_cap_rank_window: int = 24
+    mid_stage_adaptive_cap_rank_window: int = 24
+    late_stage_adaptive_cap_rank_window: int = 24
+
+    # Half-width of the popularity-position neighbourhood pooled on the
+    # historical side of the ratio (reduces single-idol noise). Clipped,
+    # not extended, at either edge of the popularity ranking.
+    early_stage_adaptive_cap_half_width: int = 2
+    mid_stage_adaptive_cap_half_width: int = 2
+    late_stage_adaptive_cap_half_width: int = 2
+
+    # Only compare against the N most recent historical events in the KNN
+    # candidate pool (by event_id), not the full lookback window (which for
+    # type 5 can span ~225 events back). Older anniversaries can reflect a
+    # materially different game meta/player base, making them a poor
+    # comparison point for "is THIS event's growth unusual". None = no cap
+    # (use every historical event the candidate pool already contains).
+    early_stage_adaptive_cap_max_recent_events: Optional[int] = 4
+    mid_stage_adaptive_cap_max_recent_events: Optional[int] = 4
+    late_stage_adaptive_cap_max_recent_events: Optional[int] = 4
+
+    # Safety-gate constant (not stage-specific): minimum number of distinct
+    # historical events that must contribute a usable pooled growth value
+    # before the adaptive ratio is trusted. Below this, falls back to the
+    # static cap unchanged.
+    adaptive_cap_min_historical_events: int = 2
+
+    # Reversal-gated EWMA override for the adaptive scale cap (default off,
+    # no behaviour change). The plain cumulative ratio (above) is stable
+    # but LAGS when the true instantaneous ratio spikes then decays (or
+    # dips then rebounds) -- found empirically on event 142 around step
+    # 190, where the cumulative ratio stayed elevated well after the real
+    # rate had already reversed, causing an over-correction. A monotonic
+    # drift (e.g. event 192's steady decline) does NOT trigger this
+    # problem, since cumulative growth naturally follows a one-directional
+    # trend. When enabled, a reversal gate checks whether the short-run
+    # trend has flipped sign relative to the longer-run trend in the
+    # pooled instantaneous-ratio series; ONLY when a reversal is detected
+    # does the cumulative ratio get replaced by an EWMA-smoothed
+    # instantaneous ratio for that idol/step.
+    use_reversal_gated_ewma: bool = False
+    reversal_rate_window: int = 40
+    reversal_sample_spacing: int = 10
+    reversal_short_window: int = 30
+    reversal_long_window: int = 80
+    reversal_min_short_magnitude: float = 0.2
+    ewma_alpha: float = 0.3
+    ewma_lookback: int = 80
+
+    # Macro-regime gate (default off, no behaviour change). Unlike the
+    # per-idol adaptive cap above (which loosens EACH idol's own bound
+    # based on that idol's individual ratio), this computes ONE
+    # event-wide, TRIMMED-MEAN cumulative growth ratio across ALL idols
+    # (no popularity top-N cutoff), checked for PERSISTENCE over recent
+    # steps (not a single snapshot), and only applies a correction if the
+    # event as a whole clears a leave-one-out cross-event variance band.
+    # If it clears, the cap's bound is set DIRECTLY to that event-wide
+    # ratio (no separate proportional-strength ramp or unit-mismatched
+    # correction target -- one ratio, one comparison, one cap value).
+    # An individual idol whose OWN position-matched ratio runs FURTHER
+    # than the event-wide number in the regime's direction (hotter when
+    # inflating, colder when deflating) is pulled back TOWARD the
+    # event-wide ratio via empirical-Bayes shrinkage: the shrink weight is
+    # derived from that idol's own recent-step ratio noise vs. the
+    # cross-idol spread (a noisy idol is pulled almost fully to the
+    # event-wide ratio; a steady one keeps most of its own value) -- there
+    # is NO fixed shrink-strength constant. An idol on the LESS-extreme
+    # side of the event ratio is left at its own value (never pulled the
+    # other way). See docs/relative_scale_search_normalization.md,
+    # "Macro-regime detector" for the full validation (leave-one-out
+    # backtest + broad holdout check against live event data). When both
+    # this and ``use_adaptive_scale_cap`` are enabled for the same stage,
+    # this macro gate takes precedence (see predictor.py wiring).
+    use_macro_regime_gate: bool = False
+    # Trailing-window length (in steps) used to rank idols by popularity
+    # for position-matching the current event's idols to historical
+    # events' idols.
+    macro_regime_rank_window: int = 24
+    # Fraction of the event's per-idol cumulative-ratio distribution
+    # trimmed from both tails before averaging into the event-wide ratio
+    # (e.g. 0.1 = drop top/bottom 10%). Removes a few unusually high/low
+    # idols (e.g. a heavily-pushed center, or a barely-started idol) from
+    # dominating the event-level number.
+    macro_regime_trim_pct: float = 0.1
+    # Minimum number of historical events that must contribute a usable
+    # leave-one-out ratio before the band (and thus any correction) is
+    # trusted. Below this, falls back to the static cap unchanged.
+    macro_regime_min_historical_events: int = 2
+    # Persistence check: the event's ratio must ALSO clear the same
+    # leave-one-out band at enough recent sample steps (not just the
+    # current step) before being trusted -- protects against a one-off
+    # spike. The same recent-steps window is reused to measure each
+    # idol's own ratio NOISE for the empirical-Bayes shrinkage (a noisy
+    # idol is shrunk harder toward the event-wide ratio). There is no
+    # fixed shrink-strength constant -- the strength is derived from
+    # measured within-idol noise vs. cross-idol spread.
+    macro_regime_persistence_window: int = 40
+    macro_regime_persistence_min_steps: int = 3
+    macro_regime_persistence_sample_spacing: int = 10
+
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
     late_stage_use_ensemble: bool = False
@@ -474,6 +605,26 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_use_relative_scale_for_search=True,
         mid_stage_use_relative_scale_for_search=True,
         late_stage_use_relative_scale_for_search=True,
+        # Macro-regime gate + proportional correction: enabled after (1) a
+        # leave-one-out backtest on 142/192/241/290/339/388 showing
+        # ramp_scale=0.67 leaves all 5 "normal" historical events
+        # byte-identical to off (their own excess vs. the leave-one-out
+        # band is 0) and reproduces near-zero regression on 142 (the one
+        # historical event with real, modest excess), and (2) a real
+        # holdout validation on live event 437 itself: using 437's own
+        # 20h/40h/60h data to predict "now" and comparing against the
+        # actual observed score, pooled across all 52 idols and P90-
+        # outlier-filtered (n=82), the model's raw (uncorrected)
+        # prediction undershoots by ~1.17x on average -- consistent with
+        # (slightly more conservative than) this mechanism's own computed
+        # correction (~1.09x) for the same event/step. See
+        # docs/relative_scale_search_normalization.md, "Macro-regime
+        # detector + proportional correction" for the full validation
+        # chain. Fixes the static (0.9, 1.1) cap's upper bound being hit
+        # on effectively every RATIO-alignment fit for 437 (raw_scale
+        # measured at 1.1-2.9 vs. the 1.1 ceiling) -- confirmed the cap,
+        # not neighbour selection, was the active bottleneck.
+        use_macro_regime_gate=True,
     )
 
 
@@ -491,7 +642,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         late_stage_lookback=25,
         early_stage_scale_cap=(0.95, 1.05),
         mid_stage_scale_cap=(0.95, 1.05),
-        late_stage_scale_cap=(0.9, 1.1),
+        late_stage_scale_cap=(0.92, 1.08),
         early_stage_metric=DistanceMetric.SLOPE_AWARE,
         mid_stage_metric=DistanceMetric.SLOPE_AWARE,
         late_stage_metric=DistanceMetric.FINAL_DIFF,

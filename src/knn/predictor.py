@@ -39,7 +39,13 @@ from src.knn.alignment import (
     single_method_predict,
 )
 from src.knn.config import AlignmentMethod, get_group_config
-from src.knn.distance import build_candidate_set, find_nearest_neighbors, to_relative_trajectory
+from src.knn.distance import (
+    build_candidate_set,
+    compute_adaptive_scale_cap,
+    compute_macro_regime_scale_cap,
+    find_nearest_neighbors,
+    to_relative_trajectory,
+)
 from src.knn.plotting import (
     is_debug_logging,
     plot_current_and_neighbors,
@@ -311,6 +317,65 @@ def _predict_for_stage(
         sources.prediction_full_df, sources.prediction_partial_df, neighbor_ids,
     )
 
+    # Adaptive scale cap: loosen ONLY the bound (upper or lower) a live,
+    # measured growth ratio for THIS idol points toward, instead of using a
+    # fixed static cap for every idol regardless of how its current growth
+    # compares to popularity-matched idols in recent historical events. See
+    # compute_adaptive_scale_cap's docstring for the full method. Off by
+    # default (falls straight through to stage.scale_cap unchanged).
+    effective_scale_cap = stage.scale_cap
+    if getattr(stage, "use_macro_regime_gate", False):
+        # Macro-regime gate takes precedence over the per-idol adaptive cap
+        # when both are enabled for a stage -- it's an event-wide statistic
+        # (identical result for every idol in the event at this step, see
+        # compute_macro_regime_scale_cap's cache), validated to avoid the
+        # per-idol mechanism's failure mode of over-correcting idols whose
+        # predictions were already accurate on events with only a modest
+        # real deviation. See docs/relative_scale_search_normalization.md.
+        all_event_ids = sorted({float(cid[0]) for cid in candidate_ids})
+        max_recent = getattr(stage, "adaptive_cap_max_recent_events", None)
+        historical_event_ids = all_event_ids[-max_recent:] if max_recent else all_event_ids
+        effective_scale_cap = compute_macro_regime_scale_cap(
+            search_df=sources.search_partial_df,
+            target_event_id=event_id,
+            target_idol_id=idol_id,
+            current_step=current_step,
+            historical_event_ids=historical_event_ids,
+            rank_window=stage.macro_regime_rank_window,
+            trim_pct=stage.macro_regime_trim_pct,
+            min_historical_events=stage.macro_regime_min_historical_events,
+            static_cap=stage.scale_cap,
+            persistence_window=stage.macro_regime_persistence_window,
+            persistence_min_steps=stage.macro_regime_persistence_min_steps,
+            persistence_sample_spacing=stage.macro_regime_persistence_sample_spacing,
+        )
+    elif getattr(stage, "use_adaptive_scale_cap", False):
+        all_event_ids = sorted({float(cid[0]) for cid in candidate_ids})
+        # Only compare against RECENT historical events -- older anniversaries
+        # can reflect a materially different game meta/player base, making
+        # them a poor comparison point for "is this event's growth unusual".
+        max_recent = getattr(stage, "adaptive_cap_max_recent_events", None)
+        historical_event_ids = all_event_ids[-max_recent:] if max_recent else all_event_ids
+        effective_scale_cap = compute_adaptive_scale_cap(
+            search_df=sources.search_partial_df,
+            target_event_id=event_id,
+            target_idol_id=idol_id,
+            current_step=current_step,
+            historical_event_ids=historical_event_ids,
+            rank_window=stage.adaptive_cap_rank_window,
+            half_width=stage.adaptive_cap_half_width,
+            min_historical_events=stage.adaptive_cap_min_historical_events,
+            static_cap=stage.scale_cap,
+            use_reversal_gated_ewma=getattr(stage, "use_reversal_gated_ewma", False),
+            reversal_rate_window=getattr(stage, "reversal_rate_window", 40),
+            reversal_sample_spacing=getattr(stage, "reversal_sample_spacing", 10),
+            reversal_short_window=getattr(stage, "reversal_short_window", 30),
+            reversal_long_window=getattr(stage, "reversal_long_window", 80),
+            reversal_min_short_magnitude=getattr(stage, "reversal_min_short_magnitude", 0.2),
+            ewma_alpha=getattr(stage, "ewma_alpha", 0.3),
+            ewma_lookback=getattr(stage, "ewma_lookback", 80),
+        )
+
     if stage.use_ensemble:
         prediction = ensemble_predict(
             current_scores=np.array(sources.current_scores),
@@ -320,7 +385,7 @@ def _predict_for_stage(
             distances=distances,
             align_lookback=stage.align_lookback,
             method_weights=stage.method_weights,
-            scale_cap=stage.scale_cap,
+            scale_cap=effective_scale_cap,
             disable_scale=config.disable_scale,
             neighbor_ids=neighbor_ids,
             weights=soft_weights,
@@ -334,7 +399,7 @@ def _predict_for_stage(
             distances=distances,
             method=AlignmentMethod.RATIO,
             align_lookback=stage.align_lookback,
-            scale_cap=stage.scale_cap,
+            scale_cap=effective_scale_cap,
             disable_scale=config.disable_scale,
             neighbor_ids=neighbor_ids,
             weights=soft_weights,

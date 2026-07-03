@@ -44,6 +44,26 @@ class StageParams:
     rank_gap_max_gap: Optional[float]
     rank_gap_target_inflation: Optional[float]
     use_relative_scale_for_search: bool
+    use_adaptive_scale_cap: bool
+    adaptive_cap_rank_window: int
+    adaptive_cap_half_width: int
+    adaptive_cap_max_recent_events: Optional[int]
+    adaptive_cap_min_historical_events: int
+    use_reversal_gated_ewma: bool
+    reversal_rate_window: int
+    reversal_sample_spacing: int
+    reversal_short_window: int
+    reversal_long_window: int
+    reversal_min_short_magnitude: float
+    ewma_alpha: float
+    ewma_lookback: int
+    use_macro_regime_gate: bool
+    macro_regime_rank_window: int
+    macro_regime_trim_pct: float
+    macro_regime_min_historical_events: int
+    macro_regime_persistence_window: int
+    macro_regime_persistence_min_steps: int
+    macro_regime_persistence_sample_spacing: int
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -71,6 +91,26 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         rank_gap_max_gap=getattr(config, f"{stage}_stage_rank_gap_max_gap", None),
         rank_gap_target_inflation=getattr(config, f"{stage}_stage_rank_gap_target_inflation", None),
         use_relative_scale_for_search=getattr(config, f"{stage}_stage_use_relative_scale_for_search", False),
+        use_adaptive_scale_cap=getattr(config, f"{stage}_stage_use_adaptive_scale_cap", False),
+        adaptive_cap_rank_window=getattr(config, f"{stage}_stage_adaptive_cap_rank_window", 24),
+        adaptive_cap_half_width=getattr(config, f"{stage}_stage_adaptive_cap_half_width", 2),
+        adaptive_cap_max_recent_events=getattr(config, f"{stage}_stage_adaptive_cap_max_recent_events", 4),
+        adaptive_cap_min_historical_events=getattr(config, "adaptive_cap_min_historical_events", 2),
+        use_reversal_gated_ewma=getattr(config, "use_reversal_gated_ewma", False),
+        reversal_rate_window=getattr(config, "reversal_rate_window", 40),
+        reversal_sample_spacing=getattr(config, "reversal_sample_spacing", 10),
+        reversal_short_window=getattr(config, "reversal_short_window", 30),
+        reversal_long_window=getattr(config, "reversal_long_window", 80),
+        reversal_min_short_magnitude=getattr(config, "reversal_min_short_magnitude", 0.2),
+        ewma_alpha=getattr(config, "ewma_alpha", 0.3),
+        ewma_lookback=getattr(config, "ewma_lookback", 80),
+        use_macro_regime_gate=getattr(config, "use_macro_regime_gate", False),
+        macro_regime_rank_window=getattr(config, "macro_regime_rank_window", 24),
+        macro_regime_trim_pct=getattr(config, "macro_regime_trim_pct", 0.1),
+        macro_regime_min_historical_events=getattr(config, "macro_regime_min_historical_events", 2),
+        macro_regime_persistence_window=getattr(config, "macro_regime_persistence_window", 40),
+        macro_regime_persistence_min_steps=getattr(config, "macro_regime_persistence_min_steps", 3),
+        macro_regime_persistence_sample_spacing=getattr(config, "macro_regime_persistence_sample_spacing", 10),
     )
 
 

@@ -149,6 +149,776 @@ def compute_event_scale_series(
         return result
 
 
+# Cache for _idol_popularity_ranking, keyed by (id(df), event_id, step,
+# rank_window). The macro-regime gate calls this heavily (every idol x every
+# historical event x every persistence sample step), so without memoization
+# it becomes O(n_idols^2 * n_events) per prediction. Weak-reference eviction
+# like the other caches in this module.
+_ranking_cache: Dict[Tuple[int, float, int, int], List[Tuple[float, float]]] = {}
+_ranking_cache_lock = threading.Lock()
+
+
+def _idol_popularity_ranking(
+    search_df: pd.DataFrame, event_id: float, current_step: int, rank_window: int,
+) -> List[Tuple[float, float]]:
+    """Rank an event's idols by AVERAGE score over the trailing
+    ``rank_window`` steps ending at ``current_step``. Returns
+    ``[(idol_id, avg_score), ...]`` sorted descending (index 0 = most
+    popular/highest standing).
+
+    Deliberately a trailing average, not cumulative growth -- cumulative
+    growth is dominated by the single latest point (since growth starts
+    near zero), which would reintroduce single-point ranking instability.
+    """
+    from src.knn.stage import scores_of
+
+    cache_key = (id(search_df), float(event_id), int(current_step), int(rank_window))
+    cached = _ranking_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    with _ranking_cache_lock:
+        cached = _ranking_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _compute_idol_popularity_ranking(search_df, event_id, current_step, rank_window)
+        _ranking_cache[cache_key] = result
+        weakref.finalize(search_df, _ranking_cache.pop, cache_key, None)
+        return result
+
+
+def _compute_idol_popularity_ranking(
+    search_df: pd.DataFrame, event_id: float, current_step: int, rank_window: int,
+) -> List[Tuple[float, float]]:
+    """Uncached core of ``_idol_popularity_ranking`` (see its docstring)."""
+    from src.knn.stage import scores_of
+
+    idol_ids = search_df.loc[search_df["event_id"] == event_id, "idol_id"].unique()
+    window_start = max(0, current_step - rank_window)
+    rows: List[Tuple[float, float]] = []
+    for iid in idol_ids:
+        arr = scores_of(search_df, event_id, iid)
+        if len(arr) == 0:
+            continue
+        end = min(current_step, len(arr))
+        lo = min(window_start, end)
+        window_vals = arr[lo:end]
+        if len(window_vals) == 0:
+            window_vals = arr[end - 1:end]
+        if len(window_vals) == 0:
+            continue
+        rows.append((float(iid), float(np.mean(window_vals))))
+    rows.sort(key=lambda kv: -kv[1])
+    return rows
+
+
+def _cumulative_growth(arr: np.ndarray, current_step: int) -> Optional[float]:
+    """``score[current_step-1] - score[0]`` for a trajectory, or ``None``
+    if the trajectory is too short to compute a meaningful growth value."""
+    if len(arr) < 2:
+        return None
+    end_idx = min(current_step, len(arr)) - 1
+    if end_idx < 1:
+        return None
+    return float(arr[end_idx] - arr[0])
+
+
+def _windowed_growth(arr: np.ndarray, step: int, window: int) -> Optional[float]:
+    """``score[end-1] - score[start]`` over the trailing ``window`` steps
+    ending at ``step`` (NOT cumulative-since-start). ``None`` if too short."""
+    end = min(step, len(arr))
+    start = max(0, end - window)
+    if end - start < 2:
+        return None
+    return float(arr[end - 1] - arr[start])
+
+
+def _pooled_instantaneous_rate(
+    search_df: pd.DataFrame,
+    event_id: float,
+    pos: int,
+    half_width: int,
+    step: int,
+    rate_window: int,
+    rank_window: int,
+) -> Optional[float]:
+    """Mean windowed growth (see ``_windowed_growth``) across idols in the
+    popularity-position neighbourhood ``[pos-half_width, pos+half_width]``
+    (clipped, not extended) of ``event_id`` at ``step``. Used for BOTH the
+    historical side (always pooled) and, in the reversal-detection /ewma
+    path, the target's own side too -- pooling the target's own recent
+    rate across its position neighbourhood (not just the single idol)
+    reduces single-idol noise in the time-series used for regime
+    detection specifically, which is a different concern from the
+    single-idol precision the cumulative-ratio path optimizes for.
+    """
+    from src.knn.stage import scores_of
+
+    ranking = _idol_popularity_ranking(search_df, event_id, step, rank_window)
+    n = len(ranking)
+    if n == 0 or pos >= n:
+        return None
+    lo, hi = max(0, pos - half_width), min(n - 1, pos + half_width)
+    vals: List[float] = []
+    for p in range(lo, hi + 1):
+        iid, _ = ranking[p]
+        arr = scores_of(search_df, event_id, iid)
+        g = _windowed_growth(arr, step, rate_window)
+        if g is not None:
+            vals.append(g)
+    return float(np.mean(vals)) if vals else None
+
+
+def _detect_ratio_reversal(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    historical_event_ids: List[float],
+    pos: int,
+    half_width: int,
+    current_step: int,
+    rank_window: int,
+    rate_window: int,
+    sample_spacing: int,
+    short_window: int,
+    long_window: int,
+    min_short_magnitude: float,
+) -> bool:
+    """Detect a SIGN REVERSAL between a short-term and a longer-term trend
+    in the pooled instantaneous ratio series -- i.e. the short-run
+    direction has flipped relative to the longer-run direction (a
+    "spike-then-decay" or "dip-then-rebound" shape), as opposed to a
+    monotonic drift in one direction the whole time (which a cumulative
+    ratio already tracks correctly and does NOT need EWMA for).
+
+    Returns False (no reversal / stick with cumulative) whenever there
+    isn't enough sampled history yet to judge -- the safe default.
+    """
+    sample_steps = list(range(max(0, current_step - long_window), current_step + 1, sample_spacing))
+    if current_step not in sample_steps:
+        sample_steps.append(current_step)
+    sample_steps = sorted(set(s for s in sample_steps if s > 0))
+    if len(sample_steps) < 5:
+        return False
+
+    ratios: List[Tuple[int, float]] = []
+    for s in sample_steps:
+        own = _pooled_instantaneous_rate(search_df, target_event_id, pos, half_width, s, rate_window, rank_window)
+        hist_vals = []
+        for eid in historical_event_ids:
+            if eid == target_event_id:
+                continue
+            hv = _pooled_instantaneous_rate(search_df, eid, pos, half_width, s, rate_window, rank_window)
+            if hv is not None:
+                hist_vals.append(hv)
+        if own is None or not hist_vals:
+            continue
+        hist_mean = np.mean(hist_vals)
+        if hist_mean and hist_mean > 0:
+            ratios.append((s, own / hist_mean))
+
+    if len(ratios) < 5:
+        return False
+
+    def _slope(pairs: List[Tuple[int, float]]) -> float:
+        if len(pairs) < 2:
+            return 0.0
+        x = np.array([p[0] for p in pairs], dtype=float)
+        y = np.array([p[1] for p in pairs], dtype=float)
+        x = x - x.mean()
+        denom = float(np.sum(x ** 2))
+        return float(np.sum(x * y) / denom) if denom > 0 else 0.0
+
+    short_pairs = [(s, r) for s, r in ratios if current_step - s <= short_window]
+    long_pairs = ratios
+    if len(short_pairs) < 3:
+        return False
+
+    s_slope = _slope(short_pairs)
+    l_slope = _slope(long_pairs)
+    if s_slope == 0 or l_slope == 0:
+        return False
+
+    short_span = short_pairs[-1][0] - short_pairs[0][0]
+    short_total_move = abs(s_slope * short_span)
+    disagree = np.sign(s_slope) != np.sign(l_slope)
+    return bool(disagree and short_total_move >= min_short_magnitude)
+
+
+def _compute_ewma_ratio(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    historical_event_ids: List[float],
+    pos: int,
+    half_width: int,
+    current_step: int,
+    rank_window: int,
+    rate_window: int,
+    sample_spacing: int,
+    alpha: float,
+    lookback: int,
+) -> Optional[float]:
+    """EWMA-smoothed instantaneous ratio: EWMA-smooth the pooled own-rate
+    and pooled historical-rate series SEPARATELY (more stable than
+    EWMA-ing a ratio-of-noisy-things directly), then take their ratio at
+    the latest sample. Only uses samples within the trailing ``lookback``
+    steps, walked forward from the oldest to build up the EWMA state --
+    deliberately NOT seeded from step 0, since an early-event EWMA with
+    no accumulated history is dominated by whichever noisy early sample
+    happened to come first (the cold-start volatility problem measured
+    directly against live event 437 data).
+    """
+    sample_steps = sorted(set(
+        s for s in range(max(0, current_step - lookback), current_step + 1, sample_spacing) if s > 0
+    ))
+    if current_step not in sample_steps:
+        sample_steps.append(current_step)
+        sample_steps.sort()
+    if len(sample_steps) < 3:
+        return None
+
+    own_prev, hist_prev = None, None
+    own_smoothed, hist_smoothed = None, None
+    for s in sample_steps:
+        own = _pooled_instantaneous_rate(search_df, target_event_id, pos, half_width, s, rate_window, rank_window)
+        hist_vals = []
+        for eid in historical_event_ids:
+            if eid == target_event_id:
+                continue
+            hv = _pooled_instantaneous_rate(search_df, eid, pos, half_width, s, rate_window, rank_window)
+            if hv is not None:
+                hist_vals.append(hv)
+        hist = float(np.mean(hist_vals)) if hist_vals else None
+        if own is not None:
+            own_prev = own if own_prev is None else (alpha * own + (1 - alpha) * own_prev)
+            own_smoothed = own_prev
+        if hist is not None:
+            hist_prev = hist if hist_prev is None else (alpha * hist + (1 - alpha) * hist_prev)
+            hist_smoothed = hist_prev
+
+    if own_smoothed is None or hist_smoothed is None or hist_smoothed <= 0:
+        return None
+    return own_smoothed / hist_smoothed
+
+
+def compute_adaptive_scale_cap(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    target_idol_id: float,
+    current_step: int,
+    historical_event_ids: List[float],
+    rank_window: int,
+    half_width: int,
+    min_historical_events: int,
+    static_cap: Tuple[float, float],
+    use_reversal_gated_ewma: bool = False,
+    reversal_rate_window: int = 40,
+    reversal_sample_spacing: int = 10,
+    reversal_short_window: int = 30,
+    reversal_long_window: int = 80,
+    reversal_min_short_magnitude: float = 0.2,
+    ewma_alpha: float = 0.3,
+    ewma_lookback: int = 80,
+) -> Tuple[float, float]:
+    """Loosen ONE bound of ``static_cap`` -- whichever side a live, measured
+    growth ratio for ``target_idol_id`` points toward -- based on how its
+    cumulative growth compares to popularity-matched idols in
+    ``historical_event_ids``.
+
+    Direction-agnostic: if the target idol is running hot relative to its
+    matched historical idols (ratio > 1), the UPPER bound is loosened to
+    ``max(static_upper, ratio)``. If running cold (ratio < 1), the LOWER
+    bound is loosened to ``min(static_lower, ratio)``. Never tightens
+    either bound. Falls back to ``static_cap`` unchanged whenever there
+    isn't enough reliable data to trust the ratio (too few contributing
+    historical events, degenerate/too-short trajectories, non-positive
+    growth on either side).
+
+    Popularity matching uses the SAME trailing-window ranking on both the
+    current event and each historical event, then clips (never extends)
+    the pooled position window ``[pos-half_width, pos+half_width]`` to
+    whatever positions actually exist in that historical event's roster --
+    e.g. position 1 with half_width=2 only pools positions {1,2,3}, not
+    {1,2,3,4,5}, so the historical comparison set never reaches further
+    into less-popular territory than the target's own popularity position.
+
+    ``use_reversal_gated_ewma`` (default False, no behaviour change): the
+    plain cumulative-growth ratio above is ~3x more stable across
+    successive prediction runs than any windowed/EWMA alternative (see
+    docs/relative_scale_search_normalization.md), but it LAGS when the
+    true instantaneous ratio has a spike-then-decay (or dip-then-rebound)
+    shape -- it stays elevated/depressed well after the real rate has
+    already reversed, causing an over-correction during the decay phase
+    (empirically found on event 142 at step 190). A plain monotonic drift
+    (event 192's steady decline) does NOT create this problem, because
+    the cumulative average naturally follows a one-directional trend.
+
+    When enabled, a REVERSAL gate (``_detect_ratio_reversal``) checks
+    whether the short-run trend has flipped sign relative to the
+    longer-run trend in the pooled instantaneous-ratio series. Only when
+    that reversal is detected does this function switch from the
+    (default, stable) cumulative ratio to an EWMA-smoothed instantaneous
+    ratio (``_compute_ewma_ratio``) for computing the loosened bound.
+    Falls back to the cumulative ratio if the EWMA computation itself
+    can't produce a usable value.
+    """
+    from src.knn.stage import scores_of
+
+    static_lower, static_upper = static_cap
+
+    cur_ranking = _idol_popularity_ranking(search_df, target_event_id, current_step, rank_window)
+    idol_ids_ordered = [iid for iid, _ in cur_ranking]
+    try:
+        pos = idol_ids_ordered.index(float(target_idol_id))
+    except ValueError:
+        return static_cap
+
+    target_arr = scores_of(search_df, target_event_id, target_idol_id)
+    cur_growth = _cumulative_growth(target_arr, current_step)
+    if cur_growth is None or not np.isfinite(cur_growth) or cur_growth <= 0:
+        return static_cap
+
+    pooled_hist_growths: List[float] = []
+    contributing_events = 0
+    for eid in historical_event_ids:
+        if eid == target_event_id:
+            continue
+        hist_ranking = _idol_popularity_ranking(search_df, eid, current_step, rank_window)
+        n_hist = len(hist_ranking)
+        if n_hist == 0 or pos >= n_hist:
+            continue
+        lo = max(0, pos - half_width)
+        hi = min(n_hist - 1, pos + half_width)
+        event_growths: List[float] = []
+        for p in range(lo, hi + 1):
+            hist_iid, _ = hist_ranking[p]
+            hist_arr = scores_of(search_df, eid, hist_iid)
+            g = _cumulative_growth(hist_arr, current_step)
+            if g is not None and np.isfinite(g) and g > 0:
+                event_growths.append(g)
+        if event_growths:
+            pooled_hist_growths.extend(event_growths)
+            contributing_events += 1
+
+    if contributing_events < min_historical_events or not pooled_hist_growths:
+        return static_cap
+
+    hist_mean_growth = float(np.mean(pooled_hist_growths))
+    if hist_mean_growth <= 0 or not np.isfinite(hist_mean_growth):
+        return static_cap
+
+    ratio = cur_growth / hist_mean_growth
+    if not np.isfinite(ratio):
+        return static_cap
+
+    # Reversal-gated EWMA override (default off): only replace the stable
+    # cumulative ratio with an EWMA-smoothed instantaneous ratio when a
+    # short-vs-long-run trend REVERSAL is detected -- a monotonic drift
+    # (no reversal) is already handled correctly by the cumulative ratio
+    # above, so this only engages for the specific spike-then-decay /
+    # dip-then-rebound shape that causes cumulative to lag.
+    if use_reversal_gated_ewma:
+        reversed_ = _detect_ratio_reversal(
+            search_df=search_df,
+            target_event_id=target_event_id,
+            historical_event_ids=historical_event_ids,
+            pos=pos,
+            half_width=half_width,
+            current_step=current_step,
+            rank_window=rank_window,
+            rate_window=reversal_rate_window,
+            sample_spacing=reversal_sample_spacing,
+            short_window=reversal_short_window,
+            long_window=reversal_long_window,
+            min_short_magnitude=reversal_min_short_magnitude,
+        )
+        if reversed_:
+            ewma_ratio = _compute_ewma_ratio(
+                search_df=search_df,
+                target_event_id=target_event_id,
+                historical_event_ids=historical_event_ids,
+                pos=pos,
+                half_width=half_width,
+                current_step=current_step,
+                rank_window=rank_window,
+                rate_window=reversal_rate_window,
+                sample_spacing=reversal_sample_spacing,
+                alpha=ewma_alpha,
+                lookback=ewma_lookback,
+            )
+            if ewma_ratio is not None and np.isfinite(ewma_ratio) and ewma_ratio > 0:
+                ratio = ewma_ratio
+
+    if ratio > 1.0:
+        return (static_lower, max(static_upper, ratio))
+    if ratio < 1.0:
+        return (min(static_lower, ratio), static_upper)
+    return static_cap
+
+
+def _trimmed_mean(values: List[float], trim_pct: float) -> Optional[float]:
+    """Mean of ``values`` after dropping the top and bottom ``trim_pct``
+    fraction. Guarantees at least 1 element is dropped per tail whenever
+    ``n >= 5`` (scipy's ``trim_mean`` floors ``n*trim_pct`` to 0 for small
+    n, silently trimming nothing); falls back to a plain mean for ``n < 5``
+    (too few values to trim meaningfully)."""
+    if not values:
+        return None
+    arr = np.sort(np.array(values, dtype=float))
+    n = len(arr)
+    if n < 5:
+        return float(np.mean(arr))
+    n_cut = max(1, int(n * trim_pct))
+    n_cut = min(n_cut, (n - 1) // 2)
+    trimmed = arr[n_cut: n - n_cut]
+    return float(np.mean(trimmed)) if len(trimmed) > 0 else float(np.mean(arr))
+
+
+def _idol_position_matched_ratio(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    idol_id: float,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+) -> Optional[float]:
+    """One idol's CUMULATIVE growth ratio against history: this idol's own
+    cumulative growth (score at ``current_step`` minus score at step 0)
+    divided by the mean cumulative growth of the POSITION-MATCHED idol in
+    each comparison event -- i.e. the idol occupying the same popularity
+    rank in that historical event at the same step. ``None`` if the idol
+    can't be ranked, its own growth is degenerate, or no historical match
+    has usable growth.
+
+    Position-matching (rather than same-idol-id) controls for the fact
+    that which specific idol is "the popular one" changes every event.
+    """
+    from src.knn.stage import scores_of
+
+    ranking = _idol_popularity_ranking(search_df, target_event_id, current_step, rank_window)
+    ids_ordered = [i for i, _ in ranking]
+    try:
+        pos = ids_ordered.index(float(idol_id))
+    except ValueError:
+        return None
+    arr = scores_of(search_df, target_event_id, idol_id)
+    g = _cumulative_growth(arr, current_step)
+    if g is None or not np.isfinite(g) or g <= 0:
+        return None
+    hist_growths: List[float] = []
+    for eid in comparison_event_ids:
+        if eid == target_event_id:
+            continue
+        hist_ranking = _idol_popularity_ranking(search_df, eid, current_step, rank_window)
+        if pos < len(hist_ranking):
+            hist_iid, _ = hist_ranking[pos]
+            hist_arr = scores_of(search_df, eid, hist_iid)
+            hg = _cumulative_growth(hist_arr, current_step)
+            if hg is not None and np.isfinite(hg) and hg > 0:
+                hist_growths.append(hg)
+    if not hist_growths:
+        return None
+    hist_mean = float(np.mean(hist_growths))
+    if hist_mean <= 0:
+        return None
+    ratio = g / hist_mean
+    return ratio if np.isfinite(ratio) else None
+
+
+def _event_ratio_and_spread(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    trim_pct: float,
+) -> Tuple[Optional[float], Optional[float], Dict[float, float]]:
+    """Compute, for ``target_event_id`` at ``current_step``:
+      - ``event_ratio``  = TRIMMED MEAN over the event's idols of each
+        idol's position-matched cumulative ratio (``removing top and
+        tail`` so a heavily-pushed or barely-started idol doesn't dominate).
+      - ``between_std``  = std ACROSS idols of those per-idol ratios
+        (the cross-idol spread -- used as the "signal" variance in the
+        empirical-Bayes shrinkage).
+      - ``per_idol_ratios`` = ``{idol_id: ratio}`` for every idol with a
+        usable ratio (returned so the caller can look up a specific idol
+        without recomputing).
+    ``event_ratio``/``between_std`` are ``None`` if no idol has a usable
+    ratio.
+    """
+    idol_ids = search_df.loc[search_df["event_id"] == target_event_id, "idol_id"].unique()
+    per_idol: Dict[float, float] = {}
+    for iid in idol_ids:
+        r = _idol_position_matched_ratio(
+            search_df, target_event_id, float(iid), comparison_event_ids, current_step, rank_window,
+        )
+        if r is not None:
+            per_idol[float(iid)] = r
+    if not per_idol:
+        return None, None, {}
+    values = list(per_idol.values())
+    event_ratio = _trimmed_mean(values, trim_pct)
+    between_std = float(np.std(values)) if len(values) > 1 else 0.0
+    return event_ratio, between_std, per_idol
+
+
+# Cache for the event-level part of the macro-regime gate (identical for
+# every idol in the event at a given step): stores
+# (event_ratio, band, between_std). Weak-reference eviction like the other
+# caches. The per-idol shrinkage is computed per call (cheap: one idol's
+# own ratio time-series) and is NOT cached here.
+_macro_regime_cache: Dict[Tuple, Tuple[Optional[float], Optional[Tuple[float, float]], Optional[float]]] = {}
+_macro_regime_cache_lock = threading.Lock()
+
+
+def compute_macro_regime_gate(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    current_step: int,
+    historical_event_ids: List[float],
+    rank_window: int,
+    trim_pct: float,
+    min_historical_events: int,
+    persistence_window: int,
+    persistence_min_steps: int,
+    persistence_sample_spacing: int,
+) -> Tuple[Optional[float], Optional[Tuple[float, float]], Optional[float]]:
+    """Decide whether ``target_event_id`` is in a genuine, PERSISTENT
+    structural regime shift relative to its historical peers.
+
+    Returns ``(event_ratio, band, between_std)``:
+      - ``event_ratio``: the event's trimmed-mean per-idol cumulative
+        ratio at ``current_step`` (see ``_event_ratio_and_spread``), or
+        ``None`` if uncomputable.
+      - ``band = (lower, upper)``: the leave-one-out cross-event normal-
+        variance band -- for each historical event, its OWN event_ratio
+        against the *other* historical events, then ``mean +/- 2*std`` of
+        those. ``None`` if too few historical events contribute.
+      - ``between_std``: cross-idol spread of the current event's per-idol
+        ratios, passed through for the empirical-Bayes shrinkage.
+
+    **Persistence check**: samples the event_ratio at recent steps
+    (spacing ``persistence_sample_spacing``, back ``persistence_window``)
+    and requires at least ``persistence_min_steps`` of them to ALSO clear
+    the band. If the current step clears the band but recent history
+    doesn't persistently agree, ``band`` is returned as ``None`` (→ caller
+    applies no correction), so a one-off spike can't trigger a breach.
+    """
+    hist_ids = [eid for eid in historical_event_ids if eid != target_event_id]
+
+    event_ratio, between_std, _ = _event_ratio_and_spread(
+        search_df, target_event_id, hist_ids, current_step, rank_window, trim_pct,
+    )
+    if event_ratio is None:
+        return None, None, None
+
+    band_ratios: List[float] = []
+    for eid in hist_ids:
+        others = [e for e in hist_ids if e != eid]
+        r, _, _ = _event_ratio_and_spread(search_df, eid, others, current_step, rank_window, trim_pct)
+        if r is not None and np.isfinite(r):
+            band_ratios.append(r)
+
+    if len(band_ratios) < min_historical_events:
+        return event_ratio, None, between_std
+
+    band_mean = float(np.mean(band_ratios))
+    band_std = float(np.std(band_ratios))
+    band = (band_mean - 2 * band_std, band_mean + 2 * band_std)
+
+    # Only bother with the (expensive) persistence check if the current
+    # step actually clears the band -- otherwise there's nothing to
+    # confirm and the caller won't correct anyway.
+    if event_ratio > band[1] or event_ratio < band[0]:
+        sample_steps = [
+            s for s in range(max(1, current_step - persistence_window), current_step, persistence_sample_spacing)
+        ]
+        if sample_steps:
+            n_clearing = 0
+            for s in sample_steps:
+                r_s, _, _ = _event_ratio_and_spread(search_df, target_event_id, hist_ids, s, rank_window, trim_pct)
+                if r_s is not None and (r_s > band[1] or r_s < band[0]):
+                    n_clearing += 1
+            if n_clearing < persistence_min_steps:
+                # Not a persistent regime shift -- suppress by nulling the
+                # band, so the caller treats it as "no correction".
+                return event_ratio, None, between_std
+
+    return event_ratio, band, between_std
+
+
+def _idol_ratio_noise(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    idol_id: float,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    persistence_window: int,
+    persistence_sample_spacing: int,
+) -> Optional[float]:
+    """Within-idol NOISE of one idol's position-matched cumulative ratio,
+    measured as the std of that ratio sampled at several recent steps
+    (spacing ``persistence_sample_spacing``, back ``persistence_window``
+    from ``current_step``). This is the "how much do I trust this idol's
+    own number" signal for the empirical-Bayes shrinkage -- a ratio that
+    jitters a lot step-to-step is noise-driven and should be shrunk hard
+    toward the event mean; a steady one is trustworthy. ``None`` if fewer
+    than 2 samples are available (can't estimate noise)."""
+    sample_steps = sorted(set(
+        list(range(max(1, current_step - persistence_window), current_step + 1, persistence_sample_spacing))
+        + [current_step]
+    ))
+    samples: List[float] = []
+    for s in sample_steps:
+        r = _idol_position_matched_ratio(
+            search_df, target_event_id, idol_id, comparison_event_ids, s, rank_window,
+        )
+        if r is not None and np.isfinite(r):
+            samples.append(r)
+    if len(samples) < 2:
+        return None
+    return float(np.std(samples))
+
+
+def compute_macro_regime_scale_cap(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    target_idol_id: float,
+    current_step: int,
+    historical_event_ids: List[float],
+    rank_window: int,
+    trim_pct: float,
+    min_historical_events: int,
+    static_cap: Tuple[float, float],
+    persistence_window: int = 40,
+    persistence_min_steps: int = 3,
+    persistence_sample_spacing: int = 10,
+) -> Tuple[float, float]:
+    """Event-level macro-regime scale cap with empirical-Bayes, stability-
+    based per-idol shrinkage.
+
+    **Step 1 -- detect (event level, cached, identical for all idols):**
+    Compute the event's trimmed-mean per-idol CUMULATIVE ratio
+    (``_event_ratio_and_spread``: each idol's cumulative growth vs. the
+    position-matched historical idols' mean, then trimmed-mean across
+    idols), and a leave-one-out cross-event normal-variance band. Require
+    the event to PERSISTENTLY clear that band (see
+    ``compute_macro_regime_gate``). If it doesn't, return ``static_cap``
+    unchanged.
+
+    **Step 2 -- base breach:** if it clears, the event-wide ratio becomes
+    the base amount by which the static cap is allowed to be breached
+    (upper bound if the event is inflating, lower bound if deflating).
+
+    **Step 3 -- per-idol stability shrinkage (empirical Bayes):** the
+    individual idol's own position-matched cumulative ratio is shrunk
+    toward the event-wide ratio by a weight derived FROM DATA, not a
+    hand-picked constant:
+
+        w = between_var / (between_var + within_var_idol)
+        effective_ratio = event_ratio + w * (idol_ratio - event_ratio)
+
+    where ``within_var_idol`` is the variance of THIS idol's own ratio
+    over recent steps (``_idol_ratio_noise`` -- how much its number
+    jitters, i.e. how unreliable it is) and ``between_var`` is the
+    cross-idol spread of ratios. A noisy idol (large within_var) gets
+    ``w -> 0`` and is pulled fully to the stable event-wide ratio; a
+    rock-steady idol (small within_var) gets ``w -> 1`` and keeps its own
+    value. The absolute pull ``(1-w)*(idol_ratio - event_ratio)`` also
+    grows with how far the idol sits from the event mean, so far-out
+    idols are adjusted more in absolute terms -- both properties the
+    design calls for. There is NO fixed shrink-strength constant; the
+    strength is entirely a function of measured noise vs. spread.
+
+    Direction: when ``event_ratio > 1`` (inflation), the shrink pulls a
+    hot idol back down toward the event mean (conservative); when
+    ``event_ratio < 1`` (deflation), it pulls a cold idol back up toward
+    it. If the idol's own ratio or noise can't be computed, fall back to
+    the (safe) event-wide ratio with no per-idol excess.
+
+    Falls back to ``static_cap`` unchanged whenever there isn't enough
+    reliable data (too few historical events, degenerate growth, or the
+    event doesn't persistently clear the band).
+    """
+    static_lower, static_upper = static_cap
+    hist_ids = [eid for eid in historical_event_ids if eid != target_event_id]
+
+    cache_key = (
+        id(search_df), float(target_event_id), int(current_step), int(rank_window),
+        float(trim_pct), int(min_historical_events), static_cap,
+        int(persistence_window), int(persistence_min_steps), int(persistence_sample_spacing),
+    )
+    cached = _macro_regime_cache.get(cache_key)
+    if cached is None:
+        with _macro_regime_cache_lock:
+            cached = _macro_regime_cache.get(cache_key)
+            if cached is None:
+                cached = compute_macro_regime_gate(
+                    search_df, target_event_id, current_step, hist_ids, rank_window,
+                    trim_pct, min_historical_events, persistence_window,
+                    persistence_min_steps, persistence_sample_spacing,
+                )
+                _macro_regime_cache[cache_key] = cached
+                weakref.finalize(search_df, _macro_regime_cache.pop, cache_key, None)
+
+    event_ratio, band, between_std = cached
+    if event_ratio is None or band is None:
+        return static_cap
+    band_lower, band_upper = band
+    if not (event_ratio > band_upper or event_ratio < band_lower):
+        return static_cap
+
+    # This idol's own cumulative ratio, and its recent-step noise.
+    idol_ratio = _idol_position_matched_ratio(
+        search_df, target_event_id, float(target_idol_id), hist_ids, current_step, rank_window,
+    )
+
+    def _shrunk_toward_event(ir: float) -> float:
+        """Pull an OVER-the-mean idol's own ratio toward the event-wide
+        ratio by an empirical-Bayes weight derived from its recent-step
+        noise (noisy idol -> pulled fully to the event ratio; steady idol
+        -> keeps most of its own value). If the idol's noise can't be
+        estimated, pull fully to the event ratio (the conservative
+        choice)."""
+        if between_std is None or between_std <= 0:
+            return event_ratio
+        within_std = _idol_ratio_noise(
+            search_df, target_event_id, float(target_idol_id), hist_ids, current_step,
+            rank_window, persistence_window, persistence_sample_spacing,
+        )
+        if within_std is None:
+            return event_ratio
+        between_var = between_std ** 2
+        within_var = within_std ** 2
+        w = between_var / (between_var + within_var) if (between_var + within_var) > 0 else 0.0
+        return event_ratio + w * (ir - event_ratio)
+
+    if event_ratio > 1.0:
+        # Inflation regime. Only idols running HOTTER than the event-wide
+        # ratio (the "over") get pulled DOWN toward it. An idol at or below
+        # the event ratio is NOT pulled up -- it keeps its own (lower)
+        # ratio, so it gets a smaller breach, never a larger one than
+        # warranted. Idols we can't rate at all fall back to the event ratio.
+        if idol_ratio is None:
+            effective_ratio = event_ratio
+        elif idol_ratio > event_ratio:
+            effective_ratio = _shrunk_toward_event(idol_ratio)
+        else:
+            effective_ratio = idol_ratio
+        return (static_lower, max(static_upper, effective_ratio))
+    if event_ratio < 1.0:
+        # Deflation regime (mirror image). Only idols running COLDER than
+        # the event-wide ratio get pulled UP toward it; an idol at or above
+        # the event ratio keeps its own (higher) value, never pulled down.
+        if idol_ratio is None:
+            effective_ratio = event_ratio
+        elif idol_ratio < event_ratio:
+            effective_ratio = _shrunk_toward_event(idol_ratio)
+        else:
+            effective_ratio = idol_ratio
+        return (min(static_lower, effective_ratio), static_upper)
+    return static_cap
+
+
 def to_relative_trajectory(
     arr: np.ndarray, event_id: float, search_df: pd.DataFrame, min_score: float = 1.0,
     ref_step: Optional[int] = None,
