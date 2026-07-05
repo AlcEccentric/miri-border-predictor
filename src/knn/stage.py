@@ -64,6 +64,17 @@ class StageParams:
     macro_regime_persistence_window: int
     macro_regime_persistence_min_steps: int
     macro_regime_persistence_sample_spacing: int
+    use_eb_shrinkage: bool
+    use_toptier_relax: bool
+    toptier_relax_sigma: float
+    toptier_relax_strength: float
+    toptier_relax_recency_lookback: int
+    toptier_relax_recency_tol: float
+    use_decay_forecast: bool
+    decay_forecast_p: float
+    decay_forecast_w: float
+    decay_forecast_window: int
+    decay_forecast_floor: float
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -111,6 +122,17 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         macro_regime_persistence_window=getattr(config, "macro_regime_persistence_window", 40),
         macro_regime_persistence_min_steps=getattr(config, "macro_regime_persistence_min_steps", 3),
         macro_regime_persistence_sample_spacing=getattr(config, "macro_regime_persistence_sample_spacing", 10),
+        use_eb_shrinkage=getattr(config, "use_eb_shrinkage", True),
+        use_toptier_relax=getattr(config, "use_toptier_relax", False),
+        toptier_relax_sigma=getattr(config, "toptier_relax_sigma", 2.0),
+        toptier_relax_strength=getattr(config, "toptier_relax_strength", 0.7),
+        toptier_relax_recency_lookback=getattr(config, "toptier_relax_recency_lookback", 46),
+        toptier_relax_recency_tol=getattr(config, "toptier_relax_recency_tol", 0.0),
+        use_decay_forecast=getattr(config, "use_decay_forecast", False),
+        decay_forecast_p=getattr(config, "decay_forecast_p", 0.8),
+        decay_forecast_w=getattr(config, "decay_forecast_w", 0.5),
+        decay_forecast_window=getattr(config, "decay_forecast_window", 46),
+        decay_forecast_floor=getattr(config, "decay_forecast_floor", 1.0),
     )
 
 

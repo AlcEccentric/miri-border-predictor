@@ -308,6 +308,74 @@ class GroupConfig:
     macro_regime_persistence_min_steps: int = 3
     macro_regime_persistence_sample_spacing: int = 10
 
+    # Empirical-Bayes per-idol shrinkage (see compute_macro_regime_scale_cap).
+    # When False, an idol's own (possibly decay-forecast) ratio is used
+    # directly as its cap anchor with NO pull toward the event-wide ratio.
+    # Shrinkage was originally a coarse guard against letting an uncertain
+    # "hot" outlier scale as much as it wanted (overshoot risk while we could
+    # not tell if the hotness was persistent). For border-100 it is superseded
+    # by the decay forecast, which estimates the actual future ratio directly
+    # (and self-corrects run-to-run), so the coarse noise-shrink is no longer
+    # wanted. NOTE: disabling this ALSO makes ``use_toptier_relax`` inert --
+    # top-tier relaxation only ever *undoes* shrinkage, so with no shrinkage
+    # there is nothing to undo (kept enabled but a no-op).
+    use_eb_shrinkage: bool = True
+
+    # Recency-gated top-tier relaxation. Inside an already-fired inflation
+    # gate, a genuine top-tier outlier (own cumulative ratio above the
+    # event-wide ratio by more than ``toptier_relax_sigma`` cross-idol
+    # standard deviations) is normally shrunk hard toward the event mean,
+    # which UNDER-predicts a real top accelerator. When enabled, if the
+    # idol is ALSO still accelerating -- judged by a WEEKDAY-ROBUST signal,
+    # the TREND of its cumulative ratio (cumulative ratio now vs.
+    # ``toptier_relax_recency_lookback`` steps earlier, both being
+    # whole-window ratios that average over weekdays, so NOT a
+    # weekday/stage-confounded single-window rate) being non-decreasing --
+    # the shrinkage is relaxed by ``toptier_relax_strength`` back toward
+    # the idol's own ratio. Only ever RAISES the cap for confirmed top
+    # accelerators; never applied on events where the gate has not fired.
+    use_toptier_relax: bool = False
+    toptier_relax_sigma: float = 2.0
+    toptier_relax_strength: float = 0.7
+    # Lookback (in steps) for the weekday-robust acceleration test: this
+    # idol's cumulative ratio now vs. this many steps earlier must be
+    # non-decreasing. ~24 steps (~25h) so it can fire once there are a
+    # couple of days of data; still a cumulative-ratio trend, not a
+    # single-window rate, so it is not weekday/stage-confounded.
+    toptier_relax_recency_lookback: int = 24
+    toptier_relax_recency_tol: float = 0.0
+
+    # Decay forecast for the macro-regime cap anchor (default off, no
+    # behaviour change; only meaningful when ``use_macro_regime_gate`` has
+    # fired). The macro gate's anchor is a CUMULATIVE (stock) ratio, so it
+    # keeps a front-loaded early surge fully weighted forever even after the
+    # live interval pace has cooled -- over-predicting a decaying surge (and
+    # propping up "tide-rider" idols whose own recent pace is already back to
+    # normal). When enabled, the anchor ratio (both the event-wide ratio and
+    # each idol's own) is replaced by a forward FORECAST of where it lands:
+    #
+    #   d_past = (R_now - R_{now-window}) / window          # recent slope
+    #   R_end  = clamp_lo(floor, R_now + p * remaining * d_past)
+    #   R_hat  = w * R_now + (1-w) * R_end
+    #
+    # Only the DECLINE direction is corrected: if the anchor is flat/rising
+    # recently (d_past >= 0) it is left unchanged (rising accelerators are
+    # handled by ``use_toptier_relax``, and a leave-one-out backtest on the 6
+    # historical anniversaries showed the recent cumulative-ratio slope is NOT
+    # a reliable forward signal -- ~half of decaying segments re-accelerate at
+    # boost/dash -- so we never extrapolate a decline upward, only trim an
+    # over-elevated decaying anchor). ``p`` (<1) decelerates the projected
+    # decline (event 437 has no historical surge-decay analog to fit ``p`` on,
+    # so it is a conservative policy value, refined on 437's own rolling
+    # self-holdout as more data arrives). ``floor`` prevents projecting the
+    # finish below historical normal. ``window`` is in normalized steps
+    # (~23/day); 46 (~2 days) is more robust than 1-day (weekday-noisy).
+    use_decay_forecast: bool = False
+    decay_forecast_p: float = 0.8
+    decay_forecast_w: float = 0.5
+    decay_forecast_window: int = 46
+    decay_forecast_floor: float = 1.0
+
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
     late_stage_use_ensemble: bool = False
@@ -625,6 +693,36 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # measured at 1.1-2.9 vs. the 1.1 ceiling) -- confirmed the cap,
         # not neighbour selection, was the active bottleneck.
         use_macro_regime_gate=True,
+        # Recency-gated relaxation of the per-idol shrinkage for genuine
+        # top-tier accelerators, to fix under-prediction of the strongest
+        # idols (e.g. the pushed centre). Only raises the cap, only for
+        # >2sigma outliers that are still accelerating (cumulative-ratio
+        # trend non-decreasing -- a weekday-robust signal), and only inside
+        # an already-fired inflation gate.
+        use_toptier_relax=True,
+        # Decay forecast: trim the cumulative (stock) anchor toward a
+        # recency-weighted forward projection so a decaying surge (and
+        # "tide-rider" idols whose own recent pace is back to normal) is no
+        # longer over-predicted. Conservative policy p=0.8 (somewhat-
+        # decelerated decline), 2-day window, floor 1.0; only ever trims a
+        # declining anchor, never lifts (rising idols -> use_toptier_relax).
+        use_decay_forecast=True,
+        # EB shrinkage removed for border-100: the decay forecast now estimates
+        # the actual future ratio per idol (and self-corrects each run), so the
+        # coarse "shrink uncertain outliers toward the event mean" guard is no
+        # longer needed. This also makes use_toptier_relax inert (nothing to
+        # undo) -- left enabled but a no-op.
+        use_eb_shrinkage=False,
+        # Rank-gap categorical exclusion: drop candidate neighbours whose
+        # within-event percentile rank differs from the target's by more than
+        # 0.2. Fixes rank-jumper idols (e.g. idol21, mid-tier historically but
+        # rank-1 in 437) whose same-idol past selves are standing-mismatched
+        # (relative level ~0.9 vs target ~2.0) and otherwise inflate raw_scale
+        # to ~2.9. Validated: historical 6-anniversary MAE 5.301->5.291%,
+        # idol21 96h->120h error -7.22%->-4.80%.
+        early_stage_rank_gap_max_gap=0.2,
+        mid_stage_rank_gap_max_gap=0.2,
+        late_stage_rank_gap_max_gap=0.2,
     )
 
 

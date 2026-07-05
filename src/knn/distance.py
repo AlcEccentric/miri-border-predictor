@@ -668,6 +668,14 @@ def _event_ratio_and_spread(
 _macro_regime_cache: Dict[Tuple, Tuple[Optional[float], Optional[Tuple[float, float]], Optional[float]]] = {}
 _macro_regime_cache_lock = threading.Lock()
 
+# Cache for the decay-forecast's trailing event_ratio lookup (event-level,
+# identical for every idol in the event at a given step). Keyed by
+# (id(search_df), event_id, step, rank_window, trim_pct). Weak-reference
+# eviction like the other caches. Without this, every idol would recompute the
+# same (t-window) event_ratio (a 52-idol scan) 52x per step.
+_decay_ev_cache: Dict[Tuple, Optional[float]] = {}
+_decay_ev_cache_lock = threading.Lock()
+
 
 def compute_macro_regime_gate(
     search_df: pd.DataFrame,
@@ -779,6 +787,61 @@ def _idol_ratio_noise(
     return float(np.std(samples))
 
 
+def _decay_forecast(
+    r_now: float, r_wago: float, w: float, p: float,
+    remaining: int, window: int, floor: float,
+) -> float:
+    """Forecast where a destaged ratio lands by extrapolating its recent
+    decline, decelerated by ``p``, blended with the current level by ``w``,
+    and clamped at ``floor``:
+
+        d_past = (r_now - r_wago) / window
+        r_end  = max(floor, r_now + p * remaining * d_past)
+        r_hat  = w * r_now + (1 - w) * r_end
+
+    Only the DECLINE direction is corrected: if the ratio is flat/rising
+    recently (``d_past >= 0``) ``r_now`` is returned unchanged, so this only
+    ever TRIMS an over-elevated decaying anchor and never amplifies upward
+    (rising accelerators are handled by the top-tier relaxation, and a
+    leave-one-out backtest on the 6 historical anniversaries showed the recent
+    cumulative-ratio slope is not a reliable forward signal -- ~half of
+    decaying segments re-accelerate at boost/dash)."""
+    if window <= 0 or remaining <= 0:
+        return r_now
+    d_past = (r_now - r_wago) / window
+    if d_past >= 0:
+        return r_now
+    r_end = max(floor, r_now + p * remaining * d_past)
+    return w * r_now + (1.0 - w) * r_end
+
+
+def _cached_trailing_event_ratio(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    hist_ids: List[float],
+    step: int,
+    rank_window: int,
+    trim_pct: float,
+) -> Optional[float]:
+    """Event-wide trimmed-mean cumulative ratio at ``step`` (see
+    ``_event_ratio_and_spread``), memoized per (df, event, step, rank_window,
+    trim_pct) so the decay forecast's trailing lookup isn't recomputed once
+    per idol."""
+    key = (id(search_df), float(target_event_id), int(step), int(rank_window), float(trim_pct))
+    cached = _decay_ev_cache.get(key)
+    if cached is not None or key in _decay_ev_cache:
+        return cached
+    with _decay_ev_cache_lock:
+        if key in _decay_ev_cache:
+            return _decay_ev_cache[key]
+        r, _, _ = _event_ratio_and_spread(
+            search_df, target_event_id, hist_ids, step, rank_window, trim_pct,
+        )
+        _decay_ev_cache[key] = r
+        weakref.finalize(search_df, _decay_ev_cache.pop, key, None)
+        return r
+
+
 def compute_macro_regime_scale_cap(
     search_df: pd.DataFrame,
     target_event_id: float,
@@ -792,6 +855,18 @@ def compute_macro_regime_scale_cap(
     persistence_window: int = 40,
     persistence_min_steps: int = 3,
     persistence_sample_spacing: int = 10,
+    use_eb_shrinkage: bool = True,
+    use_toptier_relax: bool = False,
+    toptier_relax_sigma: float = 2.0,
+    toptier_relax_strength: float = 0.7,
+    toptier_relax_recency_lookback: int = 46,
+    toptier_relax_recency_tol: float = 0.0,
+    use_decay_forecast: bool = False,
+    decay_forecast_p: float = 0.8,
+    decay_forecast_w: float = 0.5,
+    decay_forecast_window: int = 46,
+    decay_forecast_floor: float = 1.0,
+    total_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Event-level macro-regime scale cap with empirical-Bayes, stability-
     based per-idol shrinkage.
@@ -872,6 +947,38 @@ def compute_macro_regime_scale_cap(
         search_df, target_event_id, float(target_idol_id), hist_ids, current_step, rank_window,
     )
 
+    # Decay forecast: replace the cumulative (stock) anchor -- both the
+    # event-wide ratio the shrinkage pulls toward, and this idol's own ratio --
+    # with a forward projection of where it lands, so a decaying surge (and
+    # tide-rider idols whose recent pace is back to normal) is no longer over-
+    # predicted. Only trims a declining anchor (see ``_decay_forecast``); a flat/
+    # rising anchor is left untouched and handled by the top-tier relaxation
+    # below. Applied AFTER the (raw-cumulative) gate/persistence decision, so
+    # whether we correct at all is still governed by the observed regime.
+    if use_decay_forecast and total_steps is not None:
+        remaining = max(0, int(total_steps) - int(current_step))
+        _w_steps = int(decay_forecast_window)
+        if remaining > 0 and (current_step - _w_steps) >= 1:
+            ev_wago = _cached_trailing_event_ratio(
+                search_df, target_event_id, hist_ids, current_step - _w_steps,
+                rank_window, trim_pct,
+            )
+            if ev_wago is not None and np.isfinite(ev_wago):
+                event_ratio = _decay_forecast(
+                    event_ratio, ev_wago, decay_forecast_w, decay_forecast_p,
+                    remaining, _w_steps, decay_forecast_floor,
+                )
+            if idol_ratio is not None and np.isfinite(idol_ratio):
+                ir_wago = _idol_position_matched_ratio(
+                    search_df, target_event_id, float(target_idol_id), hist_ids,
+                    current_step - _w_steps, rank_window,
+                )
+                if ir_wago is not None and np.isfinite(ir_wago):
+                    idol_ratio = _decay_forecast(
+                        idol_ratio, ir_wago, decay_forecast_w, decay_forecast_p,
+                        remaining, _w_steps, decay_forecast_floor,
+                    )
+
     def _shrunk_toward_event(ir: float) -> float:
         """Pull an OVER-the-mean idol's own ratio toward the event-wide
         ratio by an empirical-Bayes weight derived from its recent-step
@@ -879,6 +986,11 @@ def compute_macro_regime_scale_cap(
         -> keeps most of its own value). If the idol's noise can't be
         estimated, pull fully to the event ratio (the conservative
         choice)."""
+        if not use_eb_shrinkage:
+            # Shrinkage disabled: use the idol's own (decay-forecast) ratio
+            # directly, no pull toward the event mean. Makes _maybe_toptier_relax
+            # a no-op (shrunk == ir), by design.
+            return ir
         if between_std is None or between_std <= 0:
             return event_ratio
         within_std = _idol_ratio_noise(
@@ -892,6 +1004,50 @@ def compute_macro_regime_scale_cap(
         w = between_var / (between_var + within_var) if (between_var + within_var) > 0 else 0.0
         return event_ratio + w * (ir - event_ratio)
 
+    def _maybe_toptier_relax(shrunk: float, ir: float) -> float:
+        """Recency-gated top-tier relaxation. A genuine top-tier outlier
+        (own ratio more than ``toptier_relax_sigma`` cross-idol standard
+        deviations above the event-wide ratio) that is ALSO still
+        accelerating gets its shrinkage partially undone -- moved back
+        toward its own ratio by ``toptier_relax_strength`` -- to fix
+        under-prediction of the strongest idols. The acceleration test is
+        WEEKDAY-ROBUST: it compares this idol's cumulative-ratio change
+        over the recent window against the EVENT-WIDE cumulative-ratio
+        change over the same window. Because a weekday dip (e.g. a low
+        Thursday) drops the whole event's ratio too, differencing the
+        idol's change against the event's change cancels that common
+        weekday component -- so a bare single-window rate (which would be
+        weekday/stage-confounded) is never used. The idol qualifies only
+        if it did NOT lose ground relative to the field, i.e. its
+        cumulative-ratio change is at least the event-wide change. Only
+        ever RAISES the value; if any precondition is missing it returns
+        the unrelaxed shrunk value."""
+        if not use_toptier_relax or between_std is None or between_std <= 0:
+            return shrunk
+        # Outlier gate: far above the event mean (this is what limits the
+        # relaxation to the top tail -- typically only a handful of idols).
+        if ir <= event_ratio + toptier_relax_sigma * between_std:
+            return shrunk
+        # Recency gate (weekday-robust): idol change vs. event-wide change.
+        prev_step = current_step - int(toptier_relax_recency_lookback)
+        if prev_step < int(rank_window):
+            return shrunk  # not enough history to judge the trend
+        prev_ir = _idol_position_matched_ratio(
+            search_df, target_event_id, float(target_idol_id), hist_ids, prev_step, rank_window,
+        )
+        if prev_ir is None:
+            return shrunk
+        prev_event, _, _ = _event_ratio_and_spread(
+            search_df, target_event_id, hist_ids, prev_step, rank_window, trim_pct,
+        )
+        if prev_event is None:
+            return shrunk
+        # Idol must not lose ground relative to the event over the window.
+        if (ir - prev_ir) < (event_ratio - prev_event) - toptier_relax_recency_tol:
+            return shrunk
+        relaxed = shrunk + toptier_relax_strength * (ir - shrunk)
+        return max(shrunk, relaxed)
+
     if event_ratio > 1.0:
         # Inflation regime. Only idols running HOTTER than the event-wide
         # ratio (the "over") get pulled DOWN toward it. An idol at or below
@@ -901,7 +1057,7 @@ def compute_macro_regime_scale_cap(
         if idol_ratio is None:
             effective_ratio = event_ratio
         elif idol_ratio > event_ratio:
-            effective_ratio = _shrunk_toward_event(idol_ratio)
+            effective_ratio = _maybe_toptier_relax(_shrunk_toward_event(idol_ratio), idol_ratio)
         else:
             effective_ratio = idol_ratio
         return (static_lower, max(static_upper, effective_ratio))

@@ -348,6 +348,21 @@ def _predict_for_stage(
             persistence_window=stage.macro_regime_persistence_window,
             persistence_min_steps=stage.macro_regime_persistence_min_steps,
             persistence_sample_spacing=stage.macro_regime_persistence_sample_spacing,
+            use_eb_shrinkage=getattr(stage, "use_eb_shrinkage", True),
+            use_toptier_relax=getattr(stage, "use_toptier_relax", False),
+            toptier_relax_sigma=getattr(stage, "toptier_relax_sigma", 2.0),
+            toptier_relax_strength=getattr(stage, "toptier_relax_strength", 0.7),
+            toptier_relax_recency_lookback=getattr(stage, "toptier_relax_recency_lookback", 46),
+            toptier_relax_recency_tol=getattr(stage, "toptier_relax_recency_tol", 0.0),
+            use_decay_forecast=getattr(stage, "use_decay_forecast", False),
+            decay_forecast_p=getattr(stage, "decay_forecast_p", 0.8),
+            decay_forecast_w=getattr(stage, "decay_forecast_w", 0.5),
+            decay_forecast_window=getattr(stage, "decay_forecast_window", 46),
+            decay_forecast_floor=getattr(stage, "decay_forecast_floor", 1.0),
+            # Normalized event length (full neighbour trajectories are all
+            # norm_event_length long); used to size the forecast's remaining
+            # horizon. None -> forecast is skipped.
+            total_steps=max((len(f) for f in neighbor_full_list), default=None),
         )
     elif getattr(stage, "use_adaptive_scale_cap", False):
         all_event_ids = sorted({float(cid[0]) for cid in candidate_ids})
