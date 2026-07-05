@@ -43,7 +43,9 @@ from src.knn.distance import (
     build_candidate_set,
     compute_adaptive_scale_cap,
     compute_macro_regime_scale_cap,
+    deseasonalize_weekday,
     find_nearest_neighbors,
+    idol_in_normal_cloud,
     to_relative_trajectory,
 )
 from src.knn.plotting import (
@@ -55,6 +57,55 @@ from src.knn.stage import get_stage_params, scores_of, select_data_sources
 
 
 MIN_CURRENT_SCORE = 5000  # skip minor idols whose latest score is too low to predict
+
+
+def _neighbor_daily_increments(
+    neighbor_full_list: List[np.ndarray],
+    weights: Optional[np.ndarray],
+    current_step: int,
+    days: int = 13,
+) -> Optional[np.ndarray]:
+    """KNN-weighted average of the neighbours' per-day score increments over
+    the REMAINING days (day boundaries at ``current_step + k*steps_per_day``),
+    used as the Δḡ_k weights for the interval-anchored cap.
+
+    The cap collapses the projected daily interval ratios via
+    ``Σ_k iR_k·Δḡ_k / Σ_k Δḡ_k``, weighting each day by how much a typical
+    neighbour scores that day (dash/boost heaviest). Only the relative sizes
+    matter (absolute scale cancels in the ratio), so the neighbours' own
+    normalized increments are used directly. Returns ``None`` if uncomputable;
+    the cap then falls back to equal weighting, which at reversion_frac=0 is
+    identical anyway."""
+    if not neighbor_full_list:
+        return None
+    L = min(len(f) for f in neighbor_full_list)
+    if L < 2 or current_step >= L - 1:
+        return None
+    if weights is None or len(weights) == 0:
+        w = np.ones(len(neighbor_full_list), dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)
+    if not np.isfinite(w.sum()) or w.sum() <= 0:
+        w = np.ones(len(neighbor_full_list), dtype=float)
+    w = w / w.sum()
+    avg = np.zeros(L, dtype=float)
+    for f, wi in zip(neighbor_full_list, w):
+        avg += wi * np.asarray(f[:L], dtype=float)
+    spd = L / float(days)
+    incs: List[float] = []
+    k = 1
+    while True:
+        start = current_step + (k - 1) * spd
+        if start >= L - 1:
+            break
+        end = min(current_step + k * spd, L - 1)
+        si = max(0, min(int(round(start)), L - 1))
+        ei = max(0, min(int(round(end)), L - 1))
+        incs.append(max(0.0, float(avg[ei] - avg[si])))
+        if current_step + k * spd >= L:
+            break
+        k += 1
+    return np.asarray(incs, dtype=float) if incs else None
 
 
 def get_filtered_df(
@@ -252,10 +303,36 @@ def _predict_for_stage(
     # fetch_neighbor_trajectories.
     search_current = np.array(current_scores_for_search)
     search_candidates = [c[:current_step] for c in candidate_partials]
-    if getattr(stage, "use_relative_scale_for_search", False):
+    _use_rel = getattr(stage, "use_relative_scale_for_search", False)
+    # PURERAW gate: an idol whose cumulative ratio is still inside the historical
+    # normal cloud is well matched by raw-score neighbours -- skip the relative
+    # rescale (added for the inflation regime) for it, keeping PURERAW. Inflated
+    # (above-band) idols keep relative search.
+    if _use_rel and getattr(stage, "use_pureraw_for_incloud", False):
+        _all_eids = sorted({float(cid[0]) for cid in candidate_ids})
+        _incloud = idol_in_normal_cloud(
+            sources.search_partial_df, event_id, idol_id, _all_eids, current_step,
+            getattr(stage, "macro_regime_rank_window", 24),
+            getattr(stage, "macro_regime_trim_pct", 0.1),
+            getattr(stage, "macro_regime_min_historical_events", 3),
+            getattr(stage, "pureraw_band_sigma", 2.0),
+        )
+        if _incloud is True:
+            _use_rel = False
+    if _use_rel:
         search_current = to_relative_trajectory(search_current, event_id, sources.search_partial_df)
         search_candidates = [
             to_relative_trajectory(c, float(cid[0]), sources.search_partial_df)
+            for c, cid in zip(search_candidates, candidate_ids)
+        ]
+    # Weekday-deseasonalize the search trajectories (remove the weekend hump so
+    # events starting on different weekdays match on underlying pace, not on
+    # misaligned humps). Composes with either raw (PURERAW) or relative search.
+    if getattr(stage, "use_deseason_search", False):
+        _nl = max((len(c) for c in candidate_partials), default=current_step)
+        search_current = deseasonalize_weekday(search_current, event_id, _nl)
+        search_candidates = [
+            deseasonalize_weekday(c, float(cid[0]), _nl)
             for c, cid in zip(search_candidates, candidate_ids)
         ]
 
@@ -317,6 +394,21 @@ def _predict_for_stage(
         sources.prediction_full_df, sources.prediction_partial_df, neighbor_ids,
     )
 
+    # Δḡ_k weights for the interval-anchored cap: KNN-weighted per-day increments
+    # of the selected neighbours over the remaining days. Only computed when the
+    # interval cap is enabled (else None -> the cumulative path is unaffected).
+    neighbor_daily_increments = None
+    if getattr(stage, "use_interval_cap", False) and neighbor_full_list:
+        if soft_weights is not None:
+            _inc_w = np.asarray(soft_weights, dtype=float)
+        elif len(distances) > 0:
+            _inc_w = 1.0 / (np.asarray(distances, dtype=float) + 1e-9)
+        else:
+            _inc_w = None
+        neighbor_daily_increments = _neighbor_daily_increments(
+            neighbor_full_list, _inc_w, current_step,
+        )
+
     # Adaptive scale cap: loosen ONLY the bound (upper or lower) a live,
     # measured growth ratio for THIS idol points toward, instead of using a
     # fixed static cap for every idol regardless of how its current growth
@@ -359,6 +451,20 @@ def _predict_for_stage(
             decay_forecast_w=getattr(stage, "decay_forecast_w", 0.5),
             decay_forecast_window=getattr(stage, "decay_forecast_window", 46),
             decay_forecast_floor=getattr(stage, "decay_forecast_floor", 1.0),
+            decay_persistence_enabled=getattr(stage, "decay_persistence_enabled", False),
+            decay_persistence_window=getattr(stage, "decay_persistence_window", 69),
+            decay_persistence_sample_spacing=getattr(stage, "decay_persistence_sample_spacing", 17),
+            decay_persistence_min_steps=getattr(stage, "decay_persistence_min_steps", 3),
+            decay_deadband=getattr(stage, "decay_deadband", 0.01),
+            use_interval_cap=getattr(stage, "use_interval_cap", False),
+            interval_cap_base_window_days=getattr(stage, "interval_cap_base_window_days", 2.0),
+            interval_cap_reversion_frac=getattr(stage, "interval_cap_reversion_frac", 0.0),
+            interval_cap_floor=getattr(stage, "interval_cap_floor", 1.0),
+            interval_cap_band_clamp=getattr(stage, "interval_cap_band_clamp", False),
+            interval_cap_band_sigma=getattr(stage, "interval_cap_band_sigma", 2.0),
+            interval_cap_band_clamp_frac=getattr(stage, "interval_cap_band_clamp_frac", 1.0),
+            interval_cap_band_reference=getattr(stage, "interval_cap_band_reference", "current_event"),
+            neighbor_daily_increments=neighbor_daily_increments,
             # Normalized event length (full neighbour trajectories are all
             # norm_event_length long); used to size the forecast's remaining
             # horizon. None -> forecast is skipped.

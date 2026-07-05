@@ -753,6 +753,78 @@ def compute_macro_regime_gate(
     return event_ratio, band, between_std
 
 
+# Normal-band ceiling on the EVENT-level ratio (leave-one-out cross-event
+# mean+sigma*std), computed independent of the gate's persistence logic, so the
+# per-idol "in-cloud" test works even on non-inflating (historical) events.
+_normal_band_cache: Dict[Tuple, Optional[float]] = {}
+_normal_band_cache_lock = threading.Lock()
+
+
+def _normal_band_upper(
+    search_df, hist_ids, current_step, rank_window, trim_pct, min_historical_events, sigma,
+) -> Optional[float]:
+    key = (
+        id(search_df), tuple(sorted(float(e) for e in hist_ids)), int(current_step),
+        int(rank_window), round(float(trim_pct), 4), int(min_historical_events),
+        round(float(sigma), 4),
+    )
+    v = _normal_band_cache.get(key, _SENTINEL)
+    if v is not _SENTINEL:
+        return v
+    with _normal_band_cache_lock:
+        v = _normal_band_cache.get(key, _SENTINEL)
+        if v is not _SENTINEL:
+            return v
+        band_ratios: List[float] = []
+        for eid in hist_ids:
+            others = [e for e in hist_ids if e != eid]
+            r, _, _ = _event_ratio_and_spread(search_df, eid, others, current_step, rank_window, trim_pct)
+            if r is not None and np.isfinite(r):
+                band_ratios.append(r)
+        res = (
+            float(np.mean(band_ratios) + sigma * np.std(band_ratios))
+            if len(band_ratios) >= min_historical_events else None
+        )
+        _normal_band_cache[key] = res
+        weakref.finalize(search_df, _normal_band_cache.pop, key, None)
+        return res
+
+
+def idol_in_normal_cloud(
+    search_df,
+    target_event_id: float,
+    idol_id: float,
+    historical_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    trim_pct: float,
+    min_historical_events: int,
+    sigma: float = 2.0,
+) -> Optional[bool]:
+    """True if this idol's position-matched CUMULATIVE ratio sits within the
+    historical normal band (<= mean + sigma*std of the leave-one-out cross-event
+    ratios) -- i.e. the idol is still inside the main cloud of past trajectories,
+    not inflated above it.
+
+    Gates PURERAW (raw neighbour search): an in-cloud idol is well matched by
+    direct raw-score neighbours, so the relative-scale rescale (added for the
+    inflation regime) is unnecessary and can distort it. Returns ``None`` when
+    the band or the idol's ratio can't be computed (caller keeps the default
+    relative-scale behaviour)."""
+    hist_ids = [e for e in historical_event_ids if e != target_event_id]
+    band_upper = _normal_band_upper(
+        search_df, hist_ids, current_step, rank_window, trim_pct, min_historical_events, sigma,
+    )
+    if band_upper is None:
+        return None
+    idol_cumR = _idol_position_matched_ratio(
+        search_df, target_event_id, float(idol_id), hist_ids, current_step, rank_window,
+    )
+    if idol_cumR is None or not np.isfinite(idol_cumR):
+        return None
+    return bool(idol_cumR <= band_upper)
+
+
 def _idol_ratio_noise(
     search_df: pd.DataFrame,
     target_event_id: float,
@@ -815,6 +887,44 @@ def _decay_forecast(
     return w * r_now + (1.0 - w) * r_end
 
 
+def _decay_decline_persists(
+    ratio_at_step,
+    current_step: int,
+    w_steps: int,
+    persistence_window: int,
+    sample_spacing: int,
+    min_steps: int,
+    deadband: float,
+) -> bool:
+    """Confirmation gate for the decay trim: True only if the ratio has been
+    DECLINING (``ratio(s) < ratio(s - w_steps) - deadband``) at ``>= min_steps``
+    of the steps sampled every ``sample_spacing`` back over the recent
+    ``persistence_window``.
+
+    Guards against a TENTATIVE (sub-weekly / weekday-trough) dip triggering the
+    trim: the decay trim projects the recent decline over the whole remaining
+    horizon, so a one/two-day lull would otherwise over-trim (measured ~66% of
+    437's trim firings were such transient dips that day-6 re-heat reversed).
+    Requiring the decline to hold across several samples spanning the window
+    forces the decline to be sustained before the (aggressive, extrapolated)
+    trim engages. ``ratio_at_step`` is a callable ``step -> Optional[float]``."""
+    checked = 0
+    confirmations = 0
+    s = int(current_step)
+    stop = int(current_step) - int(persistence_window)
+    while s >= stop:
+        if s - w_steps >= 1:
+            r_now = ratio_at_step(s)
+            r_prev = ratio_at_step(s - w_steps)
+            if (r_now is not None and r_prev is not None
+                    and np.isfinite(r_now) and np.isfinite(r_prev)):
+                checked += 1
+                if r_now < r_prev - deadband:
+                    confirmations += 1
+        s -= max(1, int(sample_spacing))
+    return checked > 0 and confirmations >= int(min_steps)
+
+
 def _cached_trailing_event_ratio(
     search_df: pd.DataFrame,
     target_event_id: float,
@@ -842,6 +952,275 @@ def _cached_trailing_event_ratio(
         return r
 
 
+def _idol_position_matched_interval_ratio(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    idol_id: float,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    window: int,
+) -> Optional[float]:
+    """Like ``_idol_position_matched_ratio`` but uses WINDOWED (trailing
+    ``window``-step interval) growth instead of cumulative growth: this idol's
+    trailing-window score gain divided by the mean trailing-window gain of the
+    position-matched idol across ``comparison_event_ids``. This is the
+    deseasonalized/destaged INTERVAL ratio (iR) -- position-matching to the same
+    normalized step in each historical event cancels the shared stage (boost),
+    and averaging over several events + a multi-day window smooths the weekday
+    effect. ``None`` if the idol can't be ranked or growth is degenerate."""
+    from src.knn.stage import scores_of
+
+    ranking = _idol_popularity_ranking(search_df, target_event_id, current_step, rank_window)
+    ids_ordered = [i for i, _ in ranking]
+    try:
+        pos = ids_ordered.index(float(idol_id))
+    except ValueError:
+        return None
+    arr = scores_of(search_df, target_event_id, idol_id)
+    g = _windowed_growth(arr, current_step, window)
+    if g is None or not np.isfinite(g) or g <= 0:
+        return None
+    hist_growths: List[float] = []
+    for eid in comparison_event_ids:
+        if eid == target_event_id:
+            continue
+        hist_ranking = _idol_popularity_ranking(search_df, eid, current_step, rank_window)
+        if pos < len(hist_ranking):
+            hist_iid, _ = hist_ranking[pos]
+            hist_arr = scores_of(search_df, eid, hist_iid)
+            hg = _windowed_growth(hist_arr, current_step, window)
+            if hg is not None and np.isfinite(hg) and hg > 0:
+                hist_growths.append(hg)
+    if not hist_growths:
+        return None
+    hist_mean = float(np.mean(hist_growths))
+    if hist_mean <= 0:
+        return None
+    ratio = g / hist_mean
+    return ratio if np.isfinite(ratio) else None
+
+
+# Historical normal-band ceiling for the per-idol INTERVAL ratio (Layer-2 band
+# clamp). Event-level (depends only on the comparison events / step / window /
+# sigma, identical for every target idol), so cached with weak-ref eviction.
+_SENTINEL = object()
+_interval_band_cache: Dict[Tuple, Optional[float]] = {}
+_interval_band_cache_lock = threading.Lock()
+
+
+def _idol_interval_band_ceiling(
+    search_df: pd.DataFrame,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    window: int,
+    sigma: float,
+) -> Optional[float]:
+    """``mean + sigma*std`` of the per-idol INTERVAL ratio across the historical
+    events at ``current_step`` -- the "normal out-performance" band ceiling in
+    the SAME units as ``_idol_position_matched_interval_ratio``.
+
+    For each historical event ``e`` and rank position ``p`` present at the step,
+    the leave-one-out interval ratio = event ``e``'s rank-``p`` idol trailing-
+    ``window`` growth divided by the mean trailing-``window`` growth of the SAME
+    rank position across the OTHER historical events. Pooled over all ``(e, p)``
+    cells (~events x ranks samples), giving a well-conditioned band. Anything a
+    live idol's iR_base sits above is treated by the clamp as an unsustainable
+    outlier. Returns ``None`` if too few cells contribute (caller then skips the
+    clamp). Position-matching cancels the shared stage; the multi-day window +
+    cross-event pooling smooth the weekday effect -- consistent with the iR
+    estimator itself."""
+    from src.knn.stage import scores_of
+
+    if len(comparison_event_ids) < 2:
+        return None
+    key = (
+        id(search_df), tuple(sorted(float(e) for e in comparison_event_ids)),
+        int(current_step), int(rank_window), int(window), round(float(sigma), 4),
+    )
+    cached = _interval_band_cache.get(key, _SENTINEL)
+    if cached is not _SENTINEL:
+        return cached
+    with _interval_band_cache_lock:
+        cached = _interval_band_cache.get(key, _SENTINEL)
+        if cached is not _SENTINEL:
+            return cached
+        rankings = {
+            e: _idol_popularity_ranking(search_df, e, current_step, rank_window)
+            for e in comparison_event_ids
+        }
+        ratios: List[float] = []
+        for e in comparison_event_ids:
+            others = [o for o in comparison_event_ids if o != e]
+            for pos, (iid, _) in enumerate(rankings[e]):
+                g = _windowed_growth(scores_of(search_df, e, iid), current_step, window)
+                if g is None or not np.isfinite(g) or g <= 0:
+                    continue
+                hgs: List[float] = []
+                for o in others:
+                    o_rank = rankings[o]
+                    if pos < len(o_rank):
+                        hg = _windowed_growth(
+                            scores_of(search_df, o, o_rank[pos][0]), current_step, window,
+                        )
+                        if hg is not None and np.isfinite(hg) and hg > 0:
+                            hgs.append(hg)
+                if hgs:
+                    m = float(np.mean(hgs))
+                    if m > 0:
+                        r = g / m
+                        if np.isfinite(r):
+                            ratios.append(r)
+        result = (
+            float(np.mean(ratios) + sigma * np.std(ratios)) if len(ratios) >= 3 else None
+        )
+        _interval_band_cache[key] = result
+        weakref.finalize(search_df, _interval_band_cache.pop, key, None)
+        return result
+
+
+# Current-event cross-idol band ceiling (Layer-2 band clamp, default reference).
+_event_band_cache: Dict[Tuple, Optional[float]] = {}
+_event_band_cache_lock = threading.Lock()
+
+
+def _event_interval_band_ceiling(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    comparison_event_ids: List[float],
+    current_step: int,
+    rank_window: int,
+    window: int,
+    sigma: float,
+) -> Optional[float]:
+    """``mean + sigma*std`` of the CURRENT event's per-idol INTERVAL ratio taken
+    ACROSS its own idols -- the ceiling above which an idol is an outlier *even
+    among this (hot) event's* idols.
+
+    Unlike the historical band (``_idol_interval_band_ceiling``), this reference
+    RISES with the event: in a broadly-hot surge the whole distribution shifts
+    up, so mean+2sigma sits at the event's own upper tail and only the genuine
+    extremes (thin-comparator / spike idols like idol44/36) are flagged -- not
+    every above-normal idol. Each idol's ratio is the same estimator the clamp
+    anchors on (``_idol_position_matched_interval_ratio``). Cached event-level;
+    ``None`` if fewer than 3 idols have a usable ratio."""
+    key = (
+        id(search_df), float(target_event_id), int(current_step),
+        int(rank_window), int(window), round(float(sigma), 4),
+    )
+    cached = _event_band_cache.get(key, _SENTINEL)
+    if cached is not _SENTINEL:
+        return cached
+    with _event_band_cache_lock:
+        cached = _event_band_cache.get(key, _SENTINEL)
+        if cached is not _SENTINEL:
+            return cached
+        idol_ids = search_df.loc[search_df["event_id"] == target_event_id, "idol_id"].unique()
+        vals: List[float] = []
+        for iid in idol_ids:
+            r = _idol_position_matched_interval_ratio(
+                search_df, target_event_id, float(iid), comparison_event_ids,
+                current_step, rank_window, window,
+            )
+            if r is not None and np.isfinite(r):
+                vals.append(r)
+        result = (
+            float(np.mean(vals) + sigma * np.std(vals)) if len(vals) >= 3 else None
+        )
+        _event_band_cache[key] = result
+        weakref.finalize(search_df, _event_band_cache.pop, key, None)
+        return result
+
+
+def _interval_cap_effective_ratio(
+    search_df: pd.DataFrame,
+    target_event_id: float,
+    target_idol_id: float,
+    current_step: int,
+    hist_ids: List[float],
+    rank_window: int,
+    total_steps: int,
+    base_window_days: float,
+    reversion_frac: float,
+    floor: float,
+    daily_increments: Optional[np.ndarray],
+    days: int = 13,
+    band_clamp: bool = False,
+    band_sigma: float = 2.0,
+    band_clamp_frac: float = 1.0,
+    band_reference: str = "current_event",
+) -> Optional[float]:
+    """Interval-anchored per-idol cap.
+
+    Anchor on the idol's recent INTERVAL ratio ``iR_base`` (trailing
+    ``base_window_days``), project it daily over the remaining horizon with a
+    reversion toward ``floor``
+    (``iR_k = floor + (iR_base - floor)*(1 - reversion_frac*tau_k)``; frac=0 ->
+    flat, >0 -> decays toward floor, <0 -> rises), and collapse to one scalar as
+    the Δḡ-weighted average ``Σ_k iR_k·Δḡ_k / Σ_k Δḡ_k`` where ``daily_increments``
+    are the neighbours' per-remaining-day score gains (dash/boost days heaviest;
+    absolute scale cancels in the ratio). At ``frac=0`` the cap is exactly
+    ``iR_base`` (the weighting is a no-op on a flat sequence). Floored at
+    ``floor``. ``None`` if the interval ratio is uncomputable (caller falls back
+    to the static cap). ``days`` = normalized event length in days (13 for
+    anniversaries, whose day<->step mapping is uniform).
+
+    **Layer-2 band clamp** (``band_clamp``): if ``iR_base`` exceeds the
+    historical normal-band ceiling (``mean + band_sigma*std`` of the same
+    interval-ratio estimator across the historical events, see
+    ``_idol_interval_band_ceiling``), pull it toward that ceiling by
+    ``band_clamp_frac`` (1.0 = clamp to the ceiling, 0.5 = halfway) BEFORE the
+    reversion projection. Only lowers an above-band anchor; in-band idols are
+    untouched. Regression-to-the-mean for the thin-comparator / spike outliers.
+    ``band_reference``: ``"current_event"`` (default) uses this event's own
+    cross-idol iR distribution (flags only the event's genuine tail -- correct
+    for a broadly-hot surge); ``"historical"`` uses the cross-event normal band
+    (over-clamps a surge, since most idols exceed the normal band)."""
+    steps_per_day = float(total_steps) / float(days)
+    window = max(2, int(round(base_window_days * steps_per_day)))
+    iR_base = _idol_position_matched_interval_ratio(
+        search_df, target_event_id, float(target_idol_id), hist_ids,
+        current_step, rank_window, window,
+    )
+    if iR_base is None or not np.isfinite(iR_base):
+        return None
+
+    if band_clamp and band_clamp_frac > 0.0:
+        if band_reference == "historical":
+            ceiling = _idol_interval_band_ceiling(
+                search_df, hist_ids, current_step, rank_window, window, band_sigma,
+            )
+        else:
+            ceiling = _event_interval_band_ceiling(
+                search_df, target_event_id, hist_ids, current_step, rank_window, window, band_sigma,
+            )
+        if ceiling is not None and np.isfinite(ceiling) and iR_base > ceiling:
+            iR_base = iR_base - band_clamp_frac * (iR_base - ceiling)
+
+    remaining_steps = int(total_steps) - int(current_step)
+    if remaining_steps <= 0:
+        return max(floor, iR_base)
+
+    if daily_increments is not None and len(daily_increments) > 0:
+        incs = np.asarray(daily_increments, dtype=float)
+        K = len(incs)
+    else:
+        K = max(1, int(round(remaining_steps / steps_per_day)))
+        incs = np.ones(K, dtype=float)
+
+    numer = 0.0
+    denom = 0.0
+    for k in range(1, K + 1):
+        tau = k / float(K)
+        iR_k = floor + (iR_base - floor) * (1.0 - reversion_frac * tau)
+        wk = float(incs[k - 1])
+        numer += iR_k * wk
+        denom += wk
+    cap = (numer / denom) if denom > 0 else iR_base
+    return max(floor, cap)
+
+
 def compute_macro_regime_scale_cap(
     search_df: pd.DataFrame,
     target_event_id: float,
@@ -866,6 +1245,20 @@ def compute_macro_regime_scale_cap(
     decay_forecast_w: float = 0.5,
     decay_forecast_window: int = 46,
     decay_forecast_floor: float = 1.0,
+    decay_persistence_enabled: bool = False,
+    decay_persistence_window: int = 69,
+    decay_persistence_sample_spacing: int = 17,
+    decay_persistence_min_steps: int = 3,
+    decay_deadband: float = 0.01,
+    use_interval_cap: bool = False,
+    interval_cap_base_window_days: float = 2.0,
+    interval_cap_reversion_frac: float = 0.0,
+    interval_cap_floor: float = 1.0,
+    interval_cap_band_clamp: bool = False,
+    interval_cap_band_sigma: float = 2.0,
+    interval_cap_band_clamp_frac: float = 1.0,
+    interval_cap_band_reference: str = "current_event",
+    neighbor_daily_increments: Optional[np.ndarray] = None,
     total_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Event-level macro-regime scale cap with empirical-Bayes, stability-
@@ -942,6 +1335,28 @@ def compute_macro_regime_scale_cap(
     if not (event_ratio > band_upper or event_ratio < band_lower):
         return static_cap
 
+    # Interval-anchored cap (takes precedence over the cumulative decay /
+    # shrinkage path below when enabled). Only meaningful in an inflation
+    # regime (event_ratio > 1); 437 is inflation. The projected cap is set as
+    # the upper bound DIRECTLY -- unlike the cumulative path it is allowed to be
+    # BELOW static_upper, so a cooled idol in a surge event is trimmed to its
+    # own recent interval pace rather than held up by the stock anchor. Falls
+    # back to the static cap if the idol's interval ratio can't be computed.
+    if use_interval_cap and event_ratio > 1.0 and total_steps is not None:
+        eff = _interval_cap_effective_ratio(
+            search_df, target_event_id, float(target_idol_id), current_step,
+            hist_ids, rank_window, int(total_steps),
+            interval_cap_base_window_days, interval_cap_reversion_frac,
+            interval_cap_floor, neighbor_daily_increments,
+            band_clamp=interval_cap_band_clamp,
+            band_sigma=interval_cap_band_sigma,
+            band_clamp_frac=interval_cap_band_clamp_frac,
+            band_reference=interval_cap_band_reference,
+        )
+        if eff is not None and np.isfinite(eff):
+            return (static_lower, max(eff, static_lower))
+        return static_cap
+
     # This idol's own cumulative ratio, and its recent-step noise.
     idol_ratio = _idol_position_matched_ratio(
         search_df, target_event_id, float(target_idol_id), hist_ids, current_step, rank_window,
@@ -963,7 +1378,18 @@ def compute_macro_regime_scale_cap(
                 search_df, target_event_id, hist_ids, current_step - _w_steps,
                 rank_window, trim_pct,
             )
-            if ev_wago is not None and np.isfinite(ev_wago):
+            # Persistence gate: only trim if the decline is SUSTAINED (not a
+            # tentative sub-weekly dip). Applied per-anchor.
+            ev_gate = True
+            if decay_persistence_enabled:
+                ev_gate = _decay_decline_persists(
+                    lambda s: _cached_trailing_event_ratio(
+                        search_df, target_event_id, hist_ids, s, rank_window, trim_pct),
+                    current_step, _w_steps, decay_persistence_window,
+                    decay_persistence_sample_spacing, decay_persistence_min_steps,
+                    decay_deadband,
+                )
+            if ev_gate and ev_wago is not None and np.isfinite(ev_wago):
                 event_ratio = _decay_forecast(
                     event_ratio, ev_wago, decay_forecast_w, decay_forecast_p,
                     remaining, _w_steps, decay_forecast_floor,
@@ -973,7 +1399,17 @@ def compute_macro_regime_scale_cap(
                     search_df, target_event_id, float(target_idol_id), hist_ids,
                     current_step - _w_steps, rank_window,
                 )
-                if ir_wago is not None and np.isfinite(ir_wago):
+                idol_gate = True
+                if decay_persistence_enabled:
+                    idol_gate = _decay_decline_persists(
+                        lambda s: _idol_position_matched_ratio(
+                            search_df, target_event_id, float(target_idol_id),
+                            hist_ids, s, rank_window),
+                        current_step, _w_steps, decay_persistence_window,
+                        decay_persistence_sample_spacing, decay_persistence_min_steps,
+                        decay_deadband,
+                    )
+                if idol_gate and ir_wago is not None and np.isfinite(ir_wago):
                     idol_ratio = _decay_forecast(
                         idol_ratio, ir_wago, decay_forecast_w, decay_forecast_p,
                         remaining, _w_steps, decay_forecast_floor,
@@ -1102,6 +1538,61 @@ def to_relative_trajectory(
     idx = max(0, min(idx, len(scale) - 1))
     ref = scale[idx]
     return arr / ref if ref > 0 else arr
+
+
+# Border-100 weekday multiplier (Mon..Sun), from decay_overestimation_context.md
+# §4. Weekend (Sat 1.10, Sun 1.07) scores more; Thu (0.94) least.
+WD_B_BORDER100 = np.array([0.96, 0.96, 1.00, 0.94, 0.99, 1.10, 1.07])
+
+# event_id -> start weekday (Mon=0..Sun=6). Populated by the caller
+# (main.py / harness) from event_info start_at. Empty -> deseason is a no-op.
+EVENT_START_WEEKDAY: Dict[float, int] = {}
+
+
+def set_event_start_weekdays(mapping: Dict[float, int]) -> None:
+    EVENT_START_WEEKDAY.clear()
+    EVENT_START_WEEKDAY.update({float(k): int(v) for k, v in mapping.items()})
+
+
+def deseasonalize_weekday(
+    arr: np.ndarray,
+    event_id: float,
+    norm_len: int,
+    wd_factors: Optional[np.ndarray] = None,
+    days: int = 13,
+    boost_frac: float = 6.0 / 13.0,
+) -> np.ndarray:
+    """Remove the weekly (weekday) seasonal hump from a normalized cumulative
+    trajectory so neighbour matching is on the underlying pace, not on weekend
+    bumps that land at different normalized positions for events starting on
+    different weekdays.
+
+    Each normalized step is mapped to its real event-day (piecewise-linear with
+    the boost point at ``boost_frac*norm_len``), then to a calendar weekday via
+    the event's start weekday; the per-step increment is divided by that
+    weekday's factor and re-cumulated. Daily-resolution (the factors are daily),
+    so it corrects the day-level weekend hump, not intra-day shape. No-op if the
+    event's start weekday is unknown."""
+    wd0 = EVENT_START_WEEKDAY.get(float(event_id))
+    a = np.asarray(arr, dtype=float)
+    L = len(a)
+    if wd0 is None or L < 2:
+        return a
+    wdf = WD_B_BORDER100 if wd_factors is None else np.asarray(wd_factors, dtype=float)
+    boost = boost_frac * float(norm_len)
+    incs = np.empty(L, dtype=float)
+    incs[0] = a[0]
+    incs[1:] = np.diff(a)
+    for s in range(1, L):
+        if boost > 0 and s <= boost:
+            real_day = (s / boost) * 6.0
+        else:
+            real_day = 6.0 + ((s - boost) / max(1.0, (norm_len - boost))) * 7.0
+        wday = int((wd0 + int(real_day)) % 7)
+        f = wdf[wday]
+        if f > 0:
+            incs[s] = incs[s] / f
+    return np.cumsum(incs)
 
 
 # ---------------------------------------------------------------------------

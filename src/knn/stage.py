@@ -44,6 +44,9 @@ class StageParams:
     rank_gap_max_gap: Optional[float]
     rank_gap_target_inflation: Optional[float]
     use_relative_scale_for_search: bool
+    use_pureraw_for_incloud: bool
+    pureraw_band_sigma: float
+    use_deseason_search: bool
     use_adaptive_scale_cap: bool
     adaptive_cap_rank_window: int
     adaptive_cap_half_width: int
@@ -75,6 +78,19 @@ class StageParams:
     decay_forecast_w: float
     decay_forecast_window: int
     decay_forecast_floor: float
+    decay_persistence_enabled: bool
+    decay_persistence_window: int
+    decay_persistence_sample_spacing: int
+    decay_persistence_min_steps: int
+    decay_deadband: float
+    use_interval_cap: bool
+    interval_cap_base_window_days: float
+    interval_cap_reversion_frac: float
+    interval_cap_floor: float
+    interval_cap_band_clamp: bool
+    interval_cap_band_sigma: float
+    interval_cap_band_clamp_frac: float
+    interval_cap_band_reference: str
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -102,6 +118,9 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         rank_gap_max_gap=getattr(config, f"{stage}_stage_rank_gap_max_gap", None),
         rank_gap_target_inflation=getattr(config, f"{stage}_stage_rank_gap_target_inflation", None),
         use_relative_scale_for_search=getattr(config, f"{stage}_stage_use_relative_scale_for_search", False),
+        use_pureraw_for_incloud=getattr(config, "use_pureraw_for_incloud", False),
+        pureraw_band_sigma=getattr(config, "pureraw_band_sigma", 2.0),
+        use_deseason_search=getattr(config, "use_deseason_search", False),
         use_adaptive_scale_cap=getattr(config, f"{stage}_stage_use_adaptive_scale_cap", False),
         adaptive_cap_rank_window=getattr(config, f"{stage}_stage_adaptive_cap_rank_window", 24),
         adaptive_cap_half_width=getattr(config, f"{stage}_stage_adaptive_cap_half_width", 2),
@@ -133,6 +152,19 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         decay_forecast_w=getattr(config, "decay_forecast_w", 0.5),
         decay_forecast_window=getattr(config, "decay_forecast_window", 46),
         decay_forecast_floor=getattr(config, "decay_forecast_floor", 1.0),
+        decay_persistence_enabled=getattr(config, "decay_persistence_enabled", False),
+        decay_persistence_window=getattr(config, "decay_persistence_window", 69),
+        decay_persistence_sample_spacing=getattr(config, "decay_persistence_sample_spacing", 17),
+        decay_persistence_min_steps=getattr(config, "decay_persistence_min_steps", 3),
+        decay_deadband=getattr(config, "decay_deadband", 0.01),
+        use_interval_cap=getattr(config, "use_interval_cap", False),
+        interval_cap_base_window_days=getattr(config, "interval_cap_base_window_days", 2.0),
+        interval_cap_reversion_frac=getattr(config, "interval_cap_reversion_frac", 0.0),
+        interval_cap_floor=getattr(config, "interval_cap_floor", 1.0),
+        interval_cap_band_clamp=getattr(config, "interval_cap_band_clamp", False),
+        interval_cap_band_sigma=getattr(config, "interval_cap_band_sigma", 2.0),
+        interval_cap_band_clamp_frac=getattr(config, "interval_cap_band_clamp_frac", 1.0),
+        interval_cap_band_reference=getattr(config, "interval_cap_band_reference", "current_event"),
     )
 
 

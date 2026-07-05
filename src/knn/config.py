@@ -177,6 +177,22 @@ class GroupConfig:
     mid_stage_use_relative_scale_for_search: bool = False
     late_stage_use_relative_scale_for_search: bool = False
 
+    # PURERAW gate (per-idol, applies to all stages that use relative search):
+    # an idol whose cumulative ratio is still inside the historical normal band
+    # (<= mean + pureraw_band_sigma*std of the leave-one-out cross-event ratios)
+    # skips the relative-scale rescale and searches on RAW scores (PURERAW), on
+    # the logic that in-cloud idols are well matched by direct historical
+    # neighbours and the rescale (added for the inflation regime) can distort
+    # them. Inflated (above-band) idols keep relative search. Default off.
+    use_pureraw_for_incloud: bool = False
+    pureraw_band_sigma: float = 2.0
+
+    # Weekday-deseasonalize the SEARCH trajectories (divide out the border-100
+    # weekday multiplier so weekend humps align across events that start on
+    # different weekdays). Requires distance.set_event_start_weekdays(...) to be
+    # populated. Default off. Composes with raw (PURERAW) or relative search.
+    use_deseason_search: bool = False
+
     # Adaptive scale cap: instead of a fixed per-stage scale_cap bound,
     # loosen ONLY the bound in the direction a live, measured ratio points
     # for THIS idol -- direction-agnostic (works for both inflation and
@@ -375,6 +391,67 @@ class GroupConfig:
     decay_forecast_w: float = 0.5
     decay_forecast_window: int = 46
     decay_forecast_floor: float = 1.0
+    # Persistence gate on the decay trim (default off = current behaviour).
+    # The trim projects the recent cumR decline over the whole remaining
+    # horizon, so a TENTATIVE (sub-weekly / weekday-trough) dip over-trims
+    # (measured ~66% of 437's trim firings were transient dips day-6 reversed).
+    # When enabled, only trim if the decline is confirmed at >= min_steps of the
+    # steps sampled every sample_spacing back over persistence_window, ignoring
+    # declines shallower than decay_deadband. Forces the decline to be sustained
+    # (survive a sub-weekly wiggle) before the aggressive trim engages.
+    decay_persistence_enabled: bool = False
+    decay_persistence_window: int = 69       # ~3 days lookback for confirmation
+    decay_persistence_sample_spacing: int = 17
+    decay_persistence_min_steps: int = 3
+    decay_deadband: float = 0.01
+
+    # Interval-anchored cap (default off, no behaviour change; A/B alternative
+    # to the cumulative decay forecast above). Only engages when the macro
+    # gate has fired (so normal, non-surging events stay on the static cap).
+    # Instead of anchoring on a CUMULATIVE (stock) ratio, it anchors on the
+    # idol's recent INTERVAL ratio (iR = trailing ``interval_cap_base_window_days``
+    # windowed growth vs. position-matched history), projects it daily over the
+    # remaining horizon with a reversion toward ``interval_cap_floor``, and
+    # collapses to one scalar as a Δḡ-weighted average (weighted by the
+    # neighbours' per-day score increments, so dash/boost days dominate):
+    #
+    #     iR_k = floor + (iR_base - floor) * (1 - reversion_frac * tau_k)
+    #     cap  = Σ_k iR_k · Δḡ_k / Σ_k Δḡ_k
+    #
+    # ``reversion_frac``: signed. 0 = hold iR flat (cap == iR_base exactly, the
+    # Δḡ-weighting is a no-op on a flat sequence); >0 = decay toward the floor
+    # by that fraction of the excess by event-end; <0 = rise. It is a POLICY
+    # PRIOR, NOT inferred from the recent slope (that is v1, noise-dominated and
+    # non-predictive -- see docs/interval_cap_tuning.md); tune it from realized
+    # outcomes as more days land. ``base_window_days``: 2.0 = iR48 (default,
+    # excludes the event's hot early intervals), 3.0 = iR72 (more stable but
+    # laggy -- re-includes the peak). Unlike the cumulative path, the resulting
+    # cap is allowed to sit BELOW the static upper bound, so a cooled idol in a
+    # surge event is trimmed to its own recent pace.
+    use_interval_cap: bool = False
+    interval_cap_base_window_days: float = 2.0
+    interval_cap_reversion_frac: float = 0.0
+    interval_cap_floor: float = 1.0
+    # Band-conditional clamp (Layer 2; default OFF -> flat interval cap only).
+    # An idol whose iR_base exceeds the HISTORICAL normal band ceiling
+    # (mean + ``band_sigma``*std of the per-idol interval ratio across the
+    # historical events x rank positions at the matched step) is treated as an
+    # unsustainable outlier and pulled back toward that ceiling by
+    # ``band_clamp_frac`` (1.0 = clamp fully to the ceiling, 0.5 = halfway, 0 =
+    # no clamp). Only ever LOWERS an above-band iR_base; in-band idols are
+    # untouched (so cooled/healthy idols keep the Layer-1 behaviour). The clamp
+    # is applied to iR_base BEFORE the reversion projection, so it composes with
+    # ``reversion_frac``. Rationale: regression-to-the-mean is strongest for
+    # extremes, and a >2sigma per-idol interval ratio is typically a thin-
+    # comparator / transient-spike artefact rather than a sustainable pace. See
+    # docs/interval_cap_tuning.md.
+    interval_cap_band_clamp: bool = False
+    interval_cap_band_sigma: float = 2.0
+    interval_cap_band_clamp_frac: float = 1.0
+    # Band reference: "current_event" (default) = this event's own cross-idol iR
+    # distribution (flags only the surge's genuine tail); "historical" = the
+    # cross-event normal band (over-clamps a hot event -- most idols exceed it).
+    interval_cap_band_reference: str = "current_event"
 
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
@@ -707,6 +784,15 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # decelerated decline), 2-day window, floor 1.0; only ever trims a
         # declining anchor, never lifts (rising idols -> use_toptier_relax).
         use_decay_forecast=True,
+        # Persistence gate ENABLED: the trim over-fired on tentative dips
+        # (~66% of 437's day-4/5 trim firings reversed when day-6 re-heated).
+        # Require the decline confirmed across ~3 days of samples before
+        # trimming, ignoring shallow (<0.01) wiggles.
+        decay_persistence_enabled=True,
+        decay_persistence_window=69,
+        decay_persistence_sample_spacing=17,
+        decay_persistence_min_steps=3,
+        decay_deadband=0.01,
         # EB shrinkage removed for border-100: the decay forecast now estimates
         # the actual future ratio per idol (and self-corrects each run), so the
         # coarse "shrink uncertain outliers toward the event mean" guard is no
@@ -723,6 +809,27 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         early_stage_rank_gap_max_gap=0.2,
         mid_stage_rank_gap_max_gap=0.2,
         late_stage_rank_gap_max_gap=0.2,
+        # Interval-anchored cap (follow-up to the cumulative decay forecast
+        # above; takes precedence over it when enabled). Anchors each idol's
+        # cap on its recent INTERVAL ratio (iR48 base) held flat (frac=0.0),
+        # so a cooled idol is trimmed to its own recent pace instead of being
+        # held up by the cumulative (stock) anchor. Flip use_interval_cap=False
+        # to A/B back to the committed cumulative decay. See
+        # docs/interval_cap_tuning.md for how to react to observations.
+        # INT (interval cap) SHELVED pending full day-6 data. Day-6 (Sunday)
+        # showed a weekend iR surge back to ~day-2 levels -> raw iR is
+        # seasonally contaminated (weekly oscillation), which breaks the
+        # flat/gradual-decay premise of the interval cap. Live method is the
+        # committed cumulative DECAY forecast. Re-enable only after iR is
+        # weekday-deseasonalized. Params kept coded (inert) for the revisit.
+        use_interval_cap=False,
+        interval_cap_base_window_days=2.0,
+        interval_cap_reversion_frac=0.0,
+        interval_cap_floor=1.0,
+        interval_cap_band_clamp=False,
+        interval_cap_band_sigma=1.5,
+        interval_cap_band_clamp_frac=0.5,
+        interval_cap_band_reference="current_event",
     )
 
 
