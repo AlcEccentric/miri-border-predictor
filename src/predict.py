@@ -5,7 +5,38 @@ import logging
 from pathlib import Path
 
 from src.knn import get_filtered_df, predict_curve_knn
+from src.knn.config import get_group_config
 from src.core.normalization import denormalize_target_to_raw
+
+
+def _apply_skip_haircut(arr: np.ndarray, first_pred_idx: int, crossing: float, f: float) -> np.ndarray:
+    """C: discount an absolute cumulative trajectory's PREDICTED growth beyond
+    ``crossing`` by factor ``f`` (piecewise). Once the running cumulative passes
+    ``crossing`` (skip-pass exhaustion point), each further predicted increment
+    is scaled by ``f``; the increment that straddles the crossing is split so
+    only its above-crossing part is discounted. The observed portion
+    (``arr[:first_pred_idx]``) is untouched. Lands exactly at
+    ``crossing + f*(final - crossing)``. No-op when the trajectory never crosses
+    or ``f>=1``."""
+    a = np.asarray(arr, dtype=float)
+    n = len(a)
+    if first_pred_idx >= n or f >= 1.0 or first_pred_idx < 1:
+        return a
+    out = a.copy()
+    prev = float(out[first_pred_idx - 1])
+    for i in range(first_pred_idx, n):
+        inc = float(a[i] - a[i - 1])
+        start, end = prev, prev + inc
+        if start >= crossing:
+            inc_adj = inc * f
+        elif end <= crossing:
+            inc_adj = inc
+        else:  # straddles the crossing
+            inc_adj = (crossing - start) + (end - crossing) * f
+        prev = start + inc_adj
+        out[i] = prev
+    return out
+
 
 def calculate_confidence_bounds(normalized_target: np.ndarray,
                                 last_known_step_index: int,
@@ -262,6 +293,10 @@ def build_result_dict(
     eid_to_len_boost_ratio: Dict,
     confidence_intervals: Dict[int, Tuple[float, float]],
     standard_event_boost_ratio: float,
+    use_skip_ceiling: bool = False,
+    skip_crossing_score: float = 2_400_000.0,
+    skip_haircut_f: float = 0.90,
+    skip_observed_blend_enabled: bool = False,
 ) -> Dict:
     # Initialize result structure
     event_name = event_name_map[event_id]
@@ -441,6 +476,32 @@ def build_result_dict(
         else:
             logging.debug(f"✓ No gap in raw data at slice point")
 
+    # C: skip-pass haircut -- discount predicted growth beyond the crossing
+    # (2.4M, raw/absolute space). Only fires when the central prediction crosses;
+    # cool idols (pred below crossing) are untouched. Bounds haircut consistently
+    # below. DOUBLE-COUNT GUARD. When the observed-blend is ON, any idol that has
+    # ALREADY crossed has its post-crossing decay fully owned by the regime-aware
+    # base (the ramp multiplier m) in distance.py -> C is turned OFF for it. Only
+    # not-yet-crossed idols (base still skip-active) get C, which haircuts the
+    # PROJECTED future crossing. When the blend is OFF, fall back to the legacy
+    # binary: C off only once >= 24h of observed post-crossing data exists.
+    _c_off = False
+    if use_skip_ceiling and len(current_raw_data) >= 1:
+        _crossed = np.where(np.asarray(current_raw_data, dtype=float) >= skip_crossing_score)[0]
+        if len(_crossed) > 0:
+            if skip_observed_blend_enabled:
+                _c_off = True  # crossed -> decay owned by the regime-aware base
+            elif len(current_raw_data) >= 2:
+                _spd_raw = max(2.0, float(full_event_length) / 13.0)
+                _c_off = ((len(current_raw_data) - 1) - int(_crossed[0])) >= _spd_raw
+    _skip_applied = False
+    if (use_skip_ceiling and not _c_off and len(current_raw_data) > 0
+            and len(raw_target) > len(current_raw_data)
+            and float(raw_target[-1]) > skip_crossing_score):
+        raw_target = _apply_skip_haircut(
+            raw_target, len(current_raw_data), skip_crossing_score, skip_haircut_f)
+        _skip_applied = True
+
     result["data"]["raw"]["target"] = [round(x) for x in raw_target.tolist()]
     
     # Denormalize bounds to raw scale for each CI level
@@ -469,8 +530,8 @@ def build_result_dict(
         )
         
         raw_bounds[confidence_level] = {
-            "upper": [round(x) for x in raw_upper.tolist()],
-            "lower": [round(x) for x in raw_lower.tolist()]
+            "upper": [round(x) for x in (_apply_skip_haircut(raw_upper, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_upper).tolist()],
+            "lower": [round(x) for x in (_apply_skip_haircut(raw_lower, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_lower).tolist()]
         }
     
     result["data"]["raw"]["bounds"] = raw_bounds
@@ -523,7 +584,9 @@ def build_result_dict(
     if abs(scale_factor - 1.0) < 1e-10:
         # No scaling case - values should be identical
         final_tolerance = abs(norm_final) * 0.005
-        if abs(norm_final - raw_final) > final_tolerance:
+        if _skip_applied:
+            logging.debug(f"Skip haircut applied: raw_final={raw_final} intentionally below norm_final={norm_final}")
+        elif abs(norm_final - raw_final) > final_tolerance:
             logging.error(f"CRITICAL: Final value mismatch (no scaling case): normalized={norm_final}, denormalized={raw_final}, diff={abs(norm_final - raw_final)}")
             logging.error(f"  This violates requirement #2: norm and denorm final values should be the same")
         else:
@@ -532,7 +595,7 @@ def build_result_dict(
         # With scaling - raw should equal norm/scale_factor
         expected_raw_final = norm_final / scale_factor
         expected_tolerance = abs(expected_raw_final) * 0.005
-        if abs(raw_final - expected_raw_final) > expected_tolerance:
+        if not _skip_applied and abs(raw_final - expected_raw_final) > expected_tolerance:
             logging.error(f"CRITICAL: Final value mismatch (with scaling): normalized={norm_final}, denormalized={raw_final}, expected={expected_raw_final}")
             logging.error(f"  Scale factor: {scale_factor}, diff: {abs(raw_final - expected_raw_final)}")
         else:
@@ -624,6 +687,23 @@ def get_predictions(
             filtered_raw = get_filtered_df(data['raw'], event_type, border, list(sub_types))
 
             try:
+                # Detect whether THIS idol's observed border score has already
+                # crossed the skip-exhaustion point (2.4M). If so, map the crossing
+                # to a normalized-step index so B bases the iR on the correct
+                # regime: pre-crossing skip-active pace while it hasn't crossed /
+                # just crossed, or the OBSERVED post-crossing pace once >= 24h past
+                # it (avoids the "look-back straddles the crossing" double-count).
+                _grp_cfg = get_group_config(float(event_type), (float(sub_type),), float(border))
+                _pre_raw = np.asarray(filtered_raw[
+                    (filtered_raw['event_id'] == event_id) &
+                    (filtered_raw['idol_id'] == idol_id)
+                ]['score'].values, dtype=float)
+                ir_crossing_step = None
+                if getattr(_grp_cfg, "use_skip_ceiling", False) and len(_pre_raw) >= 2:
+                    _above = np.where(_pre_raw >= getattr(_grp_cfg, "skip_crossing_score", 2_400_000.0))[0]
+                    if len(_above) > 0 and (len(_pre_raw) - 1) > 0:
+                        ir_crossing_step = int(round(int(_above[0]) / (len(_pre_raw) - 1) * step))
+
                 smoothed_prediction, similar_ids, distances = predict_curve_knn(
                     event_id=event_id,
                     idol_id=idol_id,
@@ -634,6 +714,7 @@ def get_predictions(
                     norm_partial_data=filtered_norm_part,
                     smooth_partial_data=filtered_smooth_part,
                     smooth_full_data=filtered_smooth_all,
+                    ir_crossing_step=ir_crossing_step,
                 )
 
                 if len(smoothed_prediction) == 0:
@@ -659,6 +740,7 @@ def get_predictions(
                     r2_client=r2_client,
                 )
                 
+                _grp_cfg = get_group_config(float(event_type), (float(sub_type),), float(border))
                 result = build_result_dict(
                     event_id=event_id,
                     event_type=event_type,
@@ -679,6 +761,10 @@ def get_predictions(
                     eid_to_len_boost_ratio=eid_to_len_boost_ratio,
                     confidence_intervals=confidence_intervals,
                     standard_event_boost_ratio=standard_event_boost_ratio,
+                    use_skip_ceiling=getattr(_grp_cfg, "use_skip_ceiling", False),
+                    skip_crossing_score=getattr(_grp_cfg, "skip_crossing_score", 2_200_000.0),
+                    skip_haircut_f=getattr(_grp_cfg, "skip_haircut_f", 0.90),
+                    skip_observed_blend_enabled=getattr(_grp_cfg, "skip_observed_blend_enabled", False),
                 )
 
                 results[idol_id][border] = result

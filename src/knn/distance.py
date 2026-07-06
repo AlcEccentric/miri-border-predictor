@@ -232,6 +232,27 @@ def _windowed_growth(arr: np.ndarray, step: int, window: int) -> Optional[float]
     return float(arr[end - 1] - arr[start])
 
 
+def _win_growth(
+    arr: np.ndarray, step: int, window: int,
+    event_id: Optional[float] = None, deseason_ir: bool = False, days: int = 13,
+) -> Optional[float]:
+    """``_windowed_growth`` optionally on the WEEKDAY-deseasonalized trajectory.
+
+    When ``deseason_ir`` is set and the event's start weekday is known, the
+    cumulative series is first passed through ``deseasonalize_weekday`` (each
+    per-step increment divided by its calendar-weekday factor) before the
+    trailing-window diff is taken. This removes the NUMERATOR's own weekday
+    phase -- the residual weekend hump the cross-event denominator averaging
+    can't cancel, which makes raw iR swing ~+8% on weekends / -3% midweek. Falls
+    back to the plain windowed growth when off, or when the start weekday is
+    unknown (no-op, byte-identical to the raw path)."""
+    if deseason_ir and event_id is not None:
+        a = np.asarray(arr, dtype=float)
+        if len(a) >= 2:
+            arr = deseasonalize_weekday(a, float(event_id), len(a), days=days)
+    return _windowed_growth(arr, step, window)
+
+
 def _pooled_instantaneous_rate(
     search_df: pd.DataFrame,
     event_id: float,
@@ -960,6 +981,10 @@ def _idol_position_matched_interval_ratio(
     current_step: int,
     rank_window: int,
     window: int,
+    deseason_ir: bool = False,
+    days: int = 13,
+    growth_end_step: Optional[int] = None,
+    growth_window: Optional[int] = None,
 ) -> Optional[float]:
     """Like ``_idol_position_matched_ratio`` but uses WINDOWED (trailing
     ``window``-step interval) growth instead of cumulative growth: this idol's
@@ -978,7 +1003,16 @@ def _idol_position_matched_interval_ratio(
     except ValueError:
         return None
     arr = scores_of(search_df, target_event_id, idol_id)
-    g = _windowed_growth(arr, current_step, window)
+    # Regime-aware growth window (B, double-count fix): by default the trailing
+    # ``window`` ending at ``current_step``. When the caller passes a
+    # ``growth_end_step`` / ``growth_window`` (post-2.4M-crossing routing) the
+    # target's iR is measured over that window instead, and the position-matched
+    # historical comparators are measured over the SAME window so the ratio stays
+    # position-matched. Ranking (WHO sits at each position) always uses
+    # ``current_step`` -- only the growth measurement window moves.
+    ge = current_step if growth_end_step is None else int(growth_end_step)
+    gw = window if growth_window is None else int(growth_window)
+    g = _win_growth(arr, ge, gw, target_event_id, deseason_ir, days)
     if g is None or not np.isfinite(g) or g <= 0:
         return None
     hist_growths: List[float] = []
@@ -989,7 +1023,7 @@ def _idol_position_matched_interval_ratio(
         if pos < len(hist_ranking):
             hist_iid, _ = hist_ranking[pos]
             hist_arr = scores_of(search_df, eid, hist_iid)
-            hg = _windowed_growth(hist_arr, current_step, window)
+            hg = _win_growth(hist_arr, ge, gw, eid, deseason_ir, days)
             if hg is not None and np.isfinite(hg) and hg > 0:
                 hist_growths.append(hg)
     if not hist_growths:
@@ -1016,6 +1050,8 @@ def _idol_interval_band_ceiling(
     rank_window: int,
     window: int,
     sigma: float,
+    deseason_ir: bool = False,
+    days: int = 13,
 ) -> Optional[float]:
     """``mean + sigma*std`` of the per-idol INTERVAL ratio across the historical
     events at ``current_step`` -- the "normal out-performance" band ceiling in
@@ -1038,6 +1074,7 @@ def _idol_interval_band_ceiling(
     key = (
         id(search_df), tuple(sorted(float(e) for e in comparison_event_ids)),
         int(current_step), int(rank_window), int(window), round(float(sigma), 4),
+        bool(deseason_ir),
     )
     cached = _interval_band_cache.get(key, _SENTINEL)
     if cached is not _SENTINEL:
@@ -1054,15 +1091,16 @@ def _idol_interval_band_ceiling(
         for e in comparison_event_ids:
             others = [o for o in comparison_event_ids if o != e]
             for pos, (iid, _) in enumerate(rankings[e]):
-                g = _windowed_growth(scores_of(search_df, e, iid), current_step, window)
+                g = _win_growth(scores_of(search_df, e, iid), current_step, window, e, deseason_ir, days)
                 if g is None or not np.isfinite(g) or g <= 0:
                     continue
                 hgs: List[float] = []
                 for o in others:
                     o_rank = rankings[o]
                     if pos < len(o_rank):
-                        hg = _windowed_growth(
+                        hg = _win_growth(
                             scores_of(search_df, o, o_rank[pos][0]), current_step, window,
+                            o, deseason_ir, days,
                         )
                         if hg is not None and np.isfinite(hg) and hg > 0:
                             hgs.append(hg)
@@ -1093,6 +1131,8 @@ def _event_interval_band_ceiling(
     rank_window: int,
     window: int,
     sigma: float,
+    deseason_ir: bool = False,
+    days: int = 13,
 ) -> Optional[float]:
     """``mean + sigma*std`` of the CURRENT event's per-idol INTERVAL ratio taken
     ACROSS its own idols -- the ceiling above which an idol is an outlier *even
@@ -1107,7 +1147,7 @@ def _event_interval_band_ceiling(
     ``None`` if fewer than 3 idols have a usable ratio."""
     key = (
         id(search_df), float(target_event_id), int(current_step),
-        int(rank_window), int(window), round(float(sigma), 4),
+        int(rank_window), int(window), round(float(sigma), 4), bool(deseason_ir),
     )
     cached = _event_band_cache.get(key, _SENTINEL)
     if cached is not _SENTINEL:
@@ -1121,7 +1161,7 @@ def _event_interval_band_ceiling(
         for iid in idol_ids:
             r = _idol_position_matched_interval_ratio(
                 search_df, target_event_id, float(iid), comparison_event_ids,
-                current_step, rank_window, window,
+                current_step, rank_window, window, deseason_ir, days,
             )
             if r is not None and np.isfinite(r):
                 vals.append(r)
@@ -1150,6 +1190,15 @@ def _interval_cap_effective_ratio(
     band_sigma: float = 2.0,
     band_clamp_frac: float = 1.0,
     band_reference: str = "current_event",
+    deseason_ir: bool = False,
+    ir_crossing_step: Optional[int] = None,
+    skip_haircut_f: float = 0.90,
+    skip_blend_enabled: bool = False,
+    skip_full_weight_days: float = 2.0,
+    skip_max_ratio: float = 1.0,
+    skip_min_ratio: float = 0.0,
+    skip_fast_weight_days: float = 0.0,
+    skip_fast_ratio: float = 1.0,
 ) -> Optional[float]:
     """Interval-anchored per-idol cap.
 
@@ -1179,10 +1228,88 @@ def _interval_cap_effective_ratio(
     (over-clamps a surge, since most idols exceed the normal band)."""
     steps_per_day = float(total_steps) / float(days)
     window = max(2, int(round(base_window_days * steps_per_day)))
-    iR_base = _idol_position_matched_interval_ratio(
-        search_df, target_event_id, float(target_idol_id), hist_ids,
-        current_step, rank_window, window,
-    )
+    # B (double-count fix): regime-aware iR base relative to the idol's OWN
+    # 2.4M crossing (``ir_crossing_step`` in normalized-step units; None = not yet
+    # crossed).
+    #   * not crossed        -> trailing ``window`` ending now (skip-active pace).
+    #   * crossed >= 24h ago  -> OBSERVED post-crossing pace: window spans only the
+    #                            post-crossing steps (the model haircut C is turned
+    #                            off for these idols in predict.py, so no
+    #                            double-count -- the decay is measured, not modelled).
+    #   * crossed < 24h ago   -> freeze on the pre-crossing skip-active pace (window
+    #                            ending AT the crossing step); C still applies the
+    #                            modelled post-crossing haircut on top.
+    g_end: Optional[int] = None
+    g_win: Optional[int] = None
+    iR_base: Optional[float] = None
+    if ir_crossing_step is not None and int(ir_crossing_step) >= 1:
+        day_steps = max(2, int(round(steps_per_day)))
+        steps_since = int(current_step) - int(ir_crossing_step)
+        if skip_blend_enabled and steps_since >= 0:
+            # Observed-decay ramp (supersedes the binary 24h switch). The
+            # post-crossing pace multiplier ``m`` ramps from the MODELLED haircut
+            # (``skip_haircut_f``) toward the idol's OWN observed decay ratio
+            # ``r_obs = iR_post / iR_pre`` as post-crossing data accrues.
+            #   * iR_pre  = pre-crossing skip-active pace (window ending AT the
+            #               crossing step).
+            #   * iR_post = observed post-crossing pace (window = the post steps).
+            # BOTH are position-matched to history at their own normalized-step
+            # windows, so the shared stage/boost multiplier cancels in EACH --
+            # ``r_obs`` is a pure pace-vs-history change, NOT the raw boost-day
+            # jump. An idol crossing right at boost reads iR_post relative to a
+            # historically-boosted comparator, so boost does not inflate r_obs.
+            # ``w = clip(steps_since / (full_weight_days*day_steps), 0, 1)``;
+            # ``r_obs`` capped at ``skip_max_ratio`` (1.0 -> the haircut can only
+            # be removed, never turned into a boost). C is OFF for crossed idols
+            # (predict.py), so ``m`` fully owns the post-crossing decay.
+            iR_pre = _idol_position_matched_interval_ratio(
+                search_df, target_event_id, float(target_idol_id), hist_ids,
+                current_step, rank_window, window, deseason_ir, days,
+                growth_end_step=int(ir_crossing_step), growth_window=window,
+            )
+            if iR_pre is not None and np.isfinite(iR_pre) and iR_pre > 0:
+                m = float(skip_haircut_f)
+                if steps_since >= 2:
+                    iR_post = _idol_position_matched_interval_ratio(
+                        search_df, target_event_id, float(target_idol_id), hist_ids,
+                        current_step, rank_window, window, deseason_ir, days,
+                        growth_end_step=int(current_step),
+                        growth_window=max(2, steps_since),
+                    )
+                    if iR_post is not None and np.isfinite(iR_post) and iR_post > 0:
+                        r_obs = min(float(skip_max_ratio),
+                                    max(float(skip_min_ratio), iR_post / iR_pre))
+                        # Asymmetric ramp: quick to LIFT the haircut when the idol
+                        # shows little/no decay (r_obs high -> converge to observed
+                        # in ``skip_fast_weight_days``), but keep the slower, more
+                        # conservative horizon when genuinely cutting (r_obs low).
+                        # Avoids leaving a non-decaying idol needlessly trimmed for
+                        # the full window. skip_fast_weight_days<=0 disables it.
+                        wdays = float(skip_full_weight_days)
+                        if (float(skip_fast_weight_days) > 0.0
+                                and r_obs >= float(skip_fast_ratio)):
+                            wdays = float(skip_fast_weight_days)
+                        full = max(1.0, wdays * day_steps)
+                        w = min(1.0, float(steps_since) / full)
+                        m = (1.0 - w) * float(skip_haircut_f) + w * r_obs
+                iR_base = m * iR_pre
+            # iR_pre uncomputable -> leave iR_base None, fall through to the
+            # generic trailing-window estimator below.
+        else:
+            # Legacy binary regime (blend off): frozen pre-crossing pace (<24h)
+            # or observed post-crossing pace (>=24h). C in predict.py flips at 24h.
+            if steps_since >= day_steps:
+                g_end = int(current_step)
+                g_win = max(2, min(window, steps_since))
+            elif steps_since >= 0:
+                g_end = int(ir_crossing_step)
+                g_win = window
+    if iR_base is None:
+        iR_base = _idol_position_matched_interval_ratio(
+            search_df, target_event_id, float(target_idol_id), hist_ids,
+            current_step, rank_window, window, deseason_ir, days,
+            growth_end_step=g_end, growth_window=g_win,
+        )
     if iR_base is None or not np.isfinite(iR_base):
         return None
 
@@ -1190,10 +1317,12 @@ def _interval_cap_effective_ratio(
         if band_reference == "historical":
             ceiling = _idol_interval_band_ceiling(
                 search_df, hist_ids, current_step, rank_window, window, band_sigma,
+                deseason_ir, days,
             )
         else:
             ceiling = _event_interval_band_ceiling(
                 search_df, target_event_id, hist_ids, current_step, rank_window, window, band_sigma,
+                deseason_ir, days,
             )
         if ceiling is not None and np.isfinite(ceiling) and iR_base > ceiling:
             iR_base = iR_base - band_clamp_frac * (iR_base - ceiling)
@@ -1258,6 +1387,17 @@ def compute_macro_regime_scale_cap(
     interval_cap_band_sigma: float = 2.0,
     interval_cap_band_clamp_frac: float = 1.0,
     interval_cap_band_reference: str = "current_event",
+    interval_cap_deseason_ir: bool = False,
+    interval_cap_hot_only: bool = False,
+    interval_cap_hot_sigma: float = 2.0,
+    interval_cap_crossing_step: Optional[int] = None,
+    interval_cap_skip_haircut_f: float = 0.90,
+    interval_cap_skip_blend_enabled: bool = False,
+    interval_cap_skip_full_weight_days: float = 2.0,
+    interval_cap_skip_max_ratio: float = 1.0,
+    interval_cap_skip_min_ratio: float = 0.0,
+    interval_cap_skip_fast_weight_days: float = 0.0,
+    interval_cap_skip_fast_ratio: float = 1.0,
     neighbor_daily_increments: Optional[np.ndarray] = None,
     total_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
@@ -1343,19 +1483,43 @@ def compute_macro_regime_scale_cap(
     # own recent interval pace rather than held up by the stock anchor. Falls
     # back to the static cap if the idol's interval ratio can't be computed.
     if use_interval_cap and event_ratio > 1.0 and total_steps is not None:
-        eff = _interval_cap_effective_ratio(
-            search_df, target_event_id, float(target_idol_id), current_step,
-            hist_ids, rank_window, int(total_steps),
-            interval_cap_base_window_days, interval_cap_reversion_frac,
-            interval_cap_floor, neighbor_daily_increments,
-            band_clamp=interval_cap_band_clamp,
-            band_sigma=interval_cap_band_sigma,
-            band_clamp_frac=interval_cap_band_clamp_frac,
-            band_reference=interval_cap_band_reference,
-        )
-        if eff is not None and np.isfinite(eff):
-            return (static_lower, max(eff, static_lower))
-        return static_cap
+        # B: per-idol routing. When ``interval_cap_hot_only``, only idols ABOVE
+        # the historical normal cloud (hot / crossing-bound) take the interval
+        # (iR) path; in-cloud (cool) idols fall through to the cumulative DECAY
+        # path below. Off -> all idols in the inflation regime take interval
+        # (prior behaviour). In a broadly-hot event (437) all idols are above
+        # the cloud, so all route to interval.
+        take_interval = True
+        if interval_cap_hot_only:
+            in_cloud = idol_in_normal_cloud(
+                search_df, target_event_id, float(target_idol_id), hist_ids,
+                current_step, rank_window, trim_pct, min_historical_events,
+                interval_cap_hot_sigma,
+            )
+            take_interval = (in_cloud is False)  # only above-cloud (hot) idols
+        if take_interval:
+            eff = _interval_cap_effective_ratio(
+                search_df, target_event_id, float(target_idol_id), current_step,
+                hist_ids, rank_window, int(total_steps),
+                interval_cap_base_window_days, interval_cap_reversion_frac,
+                interval_cap_floor, neighbor_daily_increments,
+                band_clamp=interval_cap_band_clamp,
+                band_sigma=interval_cap_band_sigma,
+                band_clamp_frac=interval_cap_band_clamp_frac,
+                band_reference=interval_cap_band_reference,
+                deseason_ir=interval_cap_deseason_ir,
+                ir_crossing_step=interval_cap_crossing_step,
+                skip_haircut_f=interval_cap_skip_haircut_f,
+                skip_blend_enabled=interval_cap_skip_blend_enabled,
+                skip_full_weight_days=interval_cap_skip_full_weight_days,
+                skip_max_ratio=interval_cap_skip_max_ratio,
+                skip_min_ratio=interval_cap_skip_min_ratio,
+                skip_fast_weight_days=interval_cap_skip_fast_weight_days,
+                skip_fast_ratio=interval_cap_skip_fast_ratio,
+            )
+            if eff is not None and np.isfinite(eff):
+                return (static_lower, max(eff, static_lower))
+            return static_cap
 
     # This idol's own cumulative ratio, and its recent-step noise.
     idol_ratio = _idol_position_matched_ratio(

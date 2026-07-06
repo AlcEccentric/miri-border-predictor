@@ -133,6 +133,7 @@ def predict_curve_knn(
     smooth_partial_data: pd.DataFrame,
     smooth_full_data: pd.DataFrame,
     candidate_cache: Optional[dict] = None,
+    ir_crossing_step: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Predict the full score trajectory for ``(event_id, idol_id, border)``.
 
@@ -176,6 +177,7 @@ def predict_curve_knn(
         norm_data=norm_data, norm_partial_data=norm_partial_data,
         smooth_partial_data=smooth_partial_data, smooth_full_data=smooth_full_data,
         candidate_cache=candidate_cache,
+        ir_crossing_step=ir_crossing_step,
     )
 
     # If we are within the blend half-width of a stage boundary, compute the
@@ -246,6 +248,7 @@ def _predict_for_stage(
     smooth_partial_data: pd.DataFrame,
     smooth_full_data: pd.DataFrame,
     candidate_cache: Optional[dict],
+    ir_crossing_step: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Produce a prediction for one fully-resolved set of stage parameters."""
     # Pick dataframes for neighbour search vs prediction
@@ -464,6 +467,17 @@ def _predict_for_stage(
             interval_cap_band_sigma=getattr(stage, "interval_cap_band_sigma", 2.0),
             interval_cap_band_clamp_frac=getattr(stage, "interval_cap_band_clamp_frac", 1.0),
             interval_cap_band_reference=getattr(stage, "interval_cap_band_reference", "current_event"),
+            interval_cap_deseason_ir=getattr(stage, "use_deseason_ir", False),
+            interval_cap_hot_only=getattr(stage, "interval_cap_hot_only", False),
+            interval_cap_hot_sigma=getattr(stage, "interval_cap_hot_sigma", 2.0),
+            interval_cap_crossing_step=ir_crossing_step,
+            interval_cap_skip_haircut_f=getattr(stage, "skip_haircut_f", 0.90),
+            interval_cap_skip_blend_enabled=getattr(stage, "skip_observed_blend_enabled", False),
+            interval_cap_skip_full_weight_days=getattr(stage, "skip_observed_full_weight_days", 2.0),
+            interval_cap_skip_max_ratio=getattr(stage, "skip_observed_max_ratio", 1.0),
+            interval_cap_skip_min_ratio=getattr(stage, "skip_observed_min_ratio", 0.0),
+            interval_cap_skip_fast_weight_days=getattr(stage, "skip_observed_fast_weight_days", 0.0),
+            interval_cap_skip_fast_ratio=getattr(stage, "skip_observed_fast_ratio", 1.0),
             neighbor_daily_increments=neighbor_daily_increments,
             # Normalized event length (full neighbour trajectories are all
             # norm_event_length long); used to size the forecast's remaining

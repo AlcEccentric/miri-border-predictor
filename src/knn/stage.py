@@ -91,6 +91,16 @@ class StageParams:
     interval_cap_band_sigma: float
     interval_cap_band_clamp_frac: float
     interval_cap_band_reference: str
+    use_deseason_ir: bool
+    interval_cap_hot_only: bool
+    interval_cap_hot_sigma: float
+    skip_haircut_f: float
+    skip_observed_blend_enabled: bool
+    skip_observed_full_weight_days: float
+    skip_observed_max_ratio: float
+    skip_observed_min_ratio: float
+    skip_observed_fast_weight_days: float
+    skip_observed_fast_ratio: float
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -165,6 +175,16 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         interval_cap_band_sigma=getattr(config, "interval_cap_band_sigma", 2.0),
         interval_cap_band_clamp_frac=getattr(config, "interval_cap_band_clamp_frac", 1.0),
         interval_cap_band_reference=getattr(config, "interval_cap_band_reference", "current_event"),
+        use_deseason_ir=getattr(config, "use_deseason_ir", False),
+        interval_cap_hot_only=getattr(config, "interval_cap_hot_only", False),
+        interval_cap_hot_sigma=getattr(config, "interval_cap_hot_sigma", 2.0),
+        skip_haircut_f=getattr(config, "skip_haircut_f", 0.90),
+        skip_observed_blend_enabled=getattr(config, "skip_observed_blend_enabled", False),
+        skip_observed_full_weight_days=getattr(config, "skip_observed_full_weight_days", 2.0),
+        skip_observed_max_ratio=getattr(config, "skip_observed_max_ratio", 1.0),
+        skip_observed_min_ratio=getattr(config, "skip_observed_min_ratio", 0.0),
+        skip_observed_fast_weight_days=getattr(config, "skip_observed_fast_weight_days", 0.0),
+        skip_observed_fast_ratio=getattr(config, "skip_observed_fast_ratio", 1.0),
     )
 
 

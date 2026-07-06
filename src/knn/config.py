@@ -452,6 +452,61 @@ class GroupConfig:
     # distribution (flags only the surge's genuine tail); "historical" = the
     # cross-event normal band (over-clamps a hot event -- most idols exceed it).
     interval_cap_band_reference: str = "current_event"
+    # A: weekday-deseasonalize the INTERVAL ratio (iR) estimator itself -- divide
+    # each event's trailing-window gain by its calendar-weekday factor (numerator
+    # included) before forming iR, removing the ~+8%/-3% weekend/midweek phase the
+    # cross-event denominator averaging can't cancel. Makes the iR-path cap stable
+    # across weekends. No-op unless the iR path runs (use_interval_cap) and event
+    # start weekdays are registered (set_event_start_weekdays). Off by default.
+    use_deseason_ir: bool = False
+    # B: route only ABOVE-cloud (hot / crossing-bound) idols to the interval (iR)
+    # path; in-cloud (cool) idols keep the cumulative DECAY path. Self-scoping:
+    # in a normal event no idol is above cloud (all stay DECAY); in a broadly-hot
+    # event (437) all are above cloud (all take iR). Requires use_interval_cap.
+    interval_cap_hot_only: bool = False
+    interval_cap_hot_sigma: float = 2.0
+    # C: skip-pass plausibility haircut. Once the (per-idol, border-100) predicted
+    # cumulative score crosses ``skip_crossing_score`` -- the point a player's
+    # total is ~exhausted of skip passes -- discount the FURTHER predicted growth
+    # by ``skip_haircut_f`` (0.90 = a conservative 10% post-crossing pace cut;
+    # tighten toward the measured ~0.75-0.80 as confidence grows). One-sided, only
+    # trims growth beyond the crossing; idols predicted below it are untouched.
+    # In-sample-437 / first-principles (no auto-pass history to backtest). Off by
+    # default; meant to pair with the iR (hot) path so it doesn't stack on the
+    # cumR-capped DECAY prediction (which already under-holds hot idols).
+    use_skip_ceiling: bool = False
+    skip_crossing_score: float = 2_400_000.0
+    skip_haircut_f: float = 0.90
+    # Observed-decay blend: as a crossed idol accrues post-crossing data,
+    # gradually replace the hardcoded modelled haircut (skip_haircut_f) with the
+    # idol's OWN observed decay ratio r_obs = iR_post / iR_pre. Both iR_pre and
+    # iR_post are position-matched to history at their own normalized-step
+    # windows, so the shared stage/boost multiplier cancels in EACH -- r_obs is a
+    # pure pace-relative-to-history change, immune to the raw boost-day jump (an
+    # idol crossing right at boost does NOT read a spuriously high r_obs). The
+    # post-crossing multiplier ramps m = (1-w)*skip_haircut_f + w*r_obs, with
+    # w = clip(steps_since / (skip_observed_full_weight_days*day_steps), 0, 1):
+    # w=0 at the crossing (pure modelled prior, since r_obs is still pure noise),
+    # w=1 once enough post data has accrued (pure observed, tier-unconfounded).
+    # r_obs is capped at ``skip_observed_max_ratio`` (1.0 -> a crossed idol that
+    # shows no real decay has its haircut smoothly REMOVED, never turned into a
+    # boost). Supersedes the old binary 24h base-switch + C-off; requires the iR
+    # (hot) path + use_skip_ceiling. Off by default.
+    skip_observed_blend_enabled: bool = False
+    skip_observed_full_weight_days: float = 2.0
+    skip_observed_max_ratio: float = 1.0
+    # Lower clamp on r_obs (0.0 -> no floor, disabled). Bounds how far a
+    # post-crossing dip can drag the haircut: r_obs is floored here, so at full
+    # weight the projection trims at most to xskip_observed_min_ratio. Guards
+    # against a transient post-crossing lull over-trimming a hot idol.
+    skip_observed_min_ratio: float = 0.0
+    # Asymmetric ramp speed: when the observed r_obs is HIGH (>= fast_ratio, i.e.
+    # the idol shows little/no decay), reach full weight in fast_weight_days
+    # instead of full_weight_days -- quick to LIFT an unwarranted haircut off a
+    # non-decaying idol, while staying slow/conservative when genuinely cutting.
+    # fast_weight_days<=0 disables (symmetric ramp).
+    skip_observed_fast_weight_days: float = 0.0
+    skip_observed_fast_ratio: float = 1.0
 
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
@@ -822,14 +877,49 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # flat/gradual-decay premise of the interval cap. Live method is the
         # committed cumulative DECAY forecast. Re-enable only after iR is
         # weekday-deseasonalized. Params kept coded (inert) for the revisit.
-        use_interval_cap=False,
-        interval_cap_base_window_days=2.0,
+        # B+C (2026-07): hot idols routed to the iR path; skip haircut past 2.4M.
+        # use_interval_cap=True with interval_cap_hot_only=True -> ABOVE-cloud
+        # (hot / crossing-bound) idols anchor on their recent INTERVAL ratio
+        # (iR, held flat: reversion_frac=0) instead of the cumR DECAY cap that
+        # under-holds them; in-cloud (cool) idols still take DECAY. use_deseason_ir
+        # weekday-cleans the iR (a ~2% refinement -- the cross-event denominator
+        # averaging already removes most of the weekday phase). The iR reversion
+        # is OFF because the skip haircut below is the intended (principled)
+        # decay, not the ad-hoc reversion. use_skip_ceiling then discounts each
+        # hot idol's predicted growth beyond 2.4M by 10% (f=0.90, conservative;
+        # tighten toward the measured ~0.75-0.80 as confidence grows). Skip
+        # haircut is in-sample-437 only (no auto-pass history to backtest);
+        # deploy conservative + tunable.
+        #
+        # Regime-aware iR base (double-count fix): the iR base is measured on the
+        # idol's CURRENT skip regime relative to its own 2.4M crossing, never a
+        # blend -- pre-crossing skip-active pace while it hasn't crossed / just
+        # crossed (<24h), or the OBSERVED post-crossing pace once >=24h past it.
+        # In the observed-post case the skip haircut C is turned OFF (predict.py),
+        # since the decay is then measured, not modelled -- applying both would
+        # double-count. Dormant until an idol actually crosses 2.4M.
+        # Flip use_interval_cap=False to revert to the committed cumulative DECAY.
+        # See docs/interval_cap_tuning.md.
+        use_interval_cap=True,
+        interval_cap_hot_only=True,
+        interval_cap_hot_sigma=2.0,
+        interval_cap_base_window_days=3.0,
         interval_cap_reversion_frac=0.0,
         interval_cap_floor=1.0,
         interval_cap_band_clamp=False,
         interval_cap_band_sigma=1.5,
         interval_cap_band_clamp_frac=0.5,
         interval_cap_band_reference="current_event",
+        use_deseason_ir=True,
+        use_skip_ceiling=True,
+        skip_crossing_score=2_400_000.0,
+        skip_haircut_f=0.80,
+        skip_observed_blend_enabled=True,
+        skip_observed_full_weight_days=2.0,
+        skip_observed_max_ratio=1.0,
+        skip_observed_min_ratio=0.70,
+        skip_observed_fast_weight_days=1.0,
+        skip_observed_fast_ratio=0.95,
     )
 
 
