@@ -913,12 +913,19 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         use_deseason_ir=True,
         use_skip_ceiling=True,
         skip_crossing_score=2_400_000.0,
-        skip_haircut_f=0.80,
+        skip_haircut_f=0.85,
         skip_observed_blend_enabled=True,
-        skip_observed_full_weight_days=2.0,
+        # 2026-07-10: slow-cut horizon set to 1.0d, fast-lift kept at 0.5d (~12h).
+        # Live crossers' position-matched r_obs stabilizes within ~a day (settled
+        # 0.79-0.98), so the model can trust the OBSERVED decay ~1 day post-crossing
+        # instead of leaning on the f=0.85 prior for 2 days. Fast-lift (0.5d) stays
+        # shorter than slow-cut (1.0d), preserving the asymmetric design (lift
+        # quickly toward 1.0 when r_obs>=0.95, cut more cautiously otherwise). m is
+        # re-derived each run so it self-corrects as r_obs fills.
+        skip_observed_full_weight_days=1.0,
         skip_observed_max_ratio=1.0,
         skip_observed_min_ratio=0.70,
-        skip_observed_fast_weight_days=1.0,
+        skip_observed_fast_weight_days=0.5,
         skip_observed_fast_ratio=0.95,
     )
 
