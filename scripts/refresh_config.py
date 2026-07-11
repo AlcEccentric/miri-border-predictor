@@ -47,6 +47,9 @@ import pandas as pd
 from scripts.analyze_percentiles import (
     analyze_confidence_intervals_for_group,
     interpolate_confidence_intervals,
+    calibrate_width_factors,
+    _inflate_interval,
+    _step_bucket,
 )
 from scripts.batch_knn_test import BatchKNNTester
 from src.storage.dynamic_config import (
@@ -238,6 +241,24 @@ def build_ci_from_results(results_df: pd.DataFrame) -> pd.DataFrame:
     interpolated = interpolate_confidence_intervals(
         step_intervals, DEFAULT_CONFIDENCE_LEVELS, DEFAULT_START_STEP, DEFAULT_END_STEP,
     )
+    # Version C: per-stage event-aware width calibration. The conformal band
+    # shape comes from idol-rows, but rows within one event are correlated, so
+    # the true exchangeable unit is the EVENT. Apply the smallest per-(step-
+    # bucket, level) width multiplier that makes leave-one-event-out coverage
+    # meet nominal in that bucket. Per-bucket (vs one global factor) stops the
+    # dash from being over-widened to fix an early-stage shortfall. Without this,
+    # refresh would emit version B (conformal, uncalibrated) which under-covers.
+    width_factors = {(bk, cl): 1.0 for bk in ('early', 'mid', 'late')
+                     for cl in DEFAULT_CONFIDENCE_LEVELS}
+    if 'event_id' in results_df.columns and results_df['event_id'].nunique() >= 2:
+        width_factors, _ = calibrate_width_factors(
+            results_df, DEFAULT_CONFIDENCE_LEVELS,
+            DEFAULT_START_STEP, DEFAULT_END_STEP, margin=0.0,
+        )
+        applied = ", ".join(f"{cl}%[{bk}]x{width_factors[(bk, cl)]:.2f}"
+                            for cl in DEFAULT_CONFIDENCE_LEVELS
+                            for bk in ('early', 'mid', 'late'))
+        logging.info(f"  CI width calibration (per-stage): {applied}")
     tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
     out_rows = []
     for step in range(DEFAULT_START_STEP, DEFAULT_END_STEP + 1):
@@ -245,7 +266,9 @@ def build_ci_from_results(results_df: pd.DataFrame) -> pd.DataFrame:
             for cl in DEFAULT_CONFIDENCE_LEVELS:
                 key = (step, tier, cl)
                 if key in interpolated:
-                    lower, upper = interpolated[key]
+                    lower, upper = _inflate_interval(
+                        interpolated[key],
+                        width_factors.get((_step_bucket(step), cl), 1.0))
                     out_rows.append({
                         "step": step,
                         "tier": tier,

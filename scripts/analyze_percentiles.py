@@ -234,27 +234,50 @@ def _coverage_from_records(recs, cl, c, bucket=None):
 
 def calibrate_width_factors(df, confidence_levels, start_step=55, end_step=299,
                             margin=0.0, max_factor=4.0):
-    """Smallest per-level width multiplier so LOEO coverage >= nominal in every
-    step bucket. Returns ``({cl: factor}, records)``. Factor 1.0 means the group
-    is already calibrated.
+    """Smallest per-(step-bucket, level) width multiplier so leave-one-event-out
+    coverage meets nominal in THAT bucket. Returns ``({(bucket, level): factor},
+    records)`` with buckets ``early``/``mid``/``late`` (see ``_step_bucket``).
+
+    Per-bucket (vs a single global factor per level) avoids over-widening the
+    buckets that already cover: a single global factor is sized by the *worst*
+    bucket, so the others over-cover (e.g. the dash, which needs little/no
+    inflation, was being widened to fix an early-stage shortfall). Per-bucket
+    lets each stage land near nominal. A bucket with no records keeps factor 1.0.
     """
     recs = _loeo_records(df, confidence_levels, start_step, end_step)
-    factors = {cl: 1.0 for cl in confidence_levels}
+    buckets = ('early', 'mid', 'late')
+    factors = {(bk, cl): 1.0 for bk in buckets for cl in confidence_levels}
     if not recs:
         return factors, recs
     grid = [round(1.0 + 0.05 * i, 2) for i in range(0, int((max_factor - 1.0) / 0.05) + 1)]
-    buckets = ('early', 'mid', 'late')
     for cl in confidence_levels:
         target = cl / 100.0 + margin
-        chosen = grid[-1]
-        for c in grid:
-            covs = [_coverage_from_records(recs, cl, c, bk)[0] for bk in buckets]
-            covs = [x for x in covs if not np.isnan(x)]
-            if covs and min(covs) >= target:
-                chosen = c
-                break
-        factors[cl] = chosen
+        for bk in buckets:
+            # No data in this bucket -> leave at 1.0 (don't blindly max-widen).
+            if _coverage_from_records(recs, cl, 1.0, bk)[1] == 0:
+                continue
+            chosen = grid[-1]
+            for c in grid:
+                cov = _coverage_from_records(recs, cl, c, bk)[0]
+                if not np.isnan(cov) and cov >= target:
+                    chosen = c
+                    break
+            factors[(bk, cl)] = chosen
     return factors, recs
+
+
+def _coverage_per_bucket_factors(recs, cl, factors):
+    """Overall realized coverage for ``cl`` when each record is inflated by its
+    own step-bucket's factor (``factors`` keyed by ``(bucket, cl)``)."""
+    hit = tot = 0
+    for rcl, bk, lo, hi, e in recs:
+        if rcl != cl:
+            continue
+        ilo, ihi = _inflate_interval((lo, hi), factors.get((bk, cl), 1.0))
+        tot += 1
+        if ilo <= e <= ihi:
+            hit += 1
+    return (hit / tot if tot else float('nan')), tot
 
 
 def main():
@@ -310,16 +333,19 @@ def main():
             # per-confidence-level factor so leave-one-event-out coverage meets
             # nominal in every step bucket. Honest for clustered, few-event data
             # where the band shape (from rows) is fine but the width is not.
-            width_factors = {cl: 1.0 for cl in args.confidence_levels}
+            width_factors = {(bk, cl): 1.0 for bk in ('early', 'mid', 'late')
+                             for cl in args.confidence_levels}
             if args.calibrate_width and 'event_id' in df.columns \
                     and df['event_id'].nunique() >= 2:
                 width_factors, _ = calibrate_width_factors(
                     df, args.confidence_levels, args.start_step, args.end_step,
                     margin=args.coverage_margin,
                 )
-                applied = ", ".join(f"{cl}%×{width_factors[cl]:.2f}"
-                                    for cl in args.confidence_levels)
-                print(f"  width calibration (event-aware): {applied}")
+                applied = ", ".join(
+                    f"{cl}%[{bk}]×{width_factors[(bk, cl)]:.2f}"
+                    for cl in args.confidence_levels
+                    for bk in ('early', 'mid', 'late'))
+                print(f"  width calibration (per-stage): {applied}")
 
             tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
             output_data = []
@@ -329,7 +355,8 @@ def main():
                         key = (step, tier, confidence_level)
                         if key in interpolated:
                             bounds = _inflate_interval(
-                                interpolated[key], width_factors.get(confidence_level, 1.0))
+                                interpolated[key],
+                                width_factors.get((_step_bucket(step), confidence_level), 1.0))
                             output_data.append({
                                 'step': step,
                                 'tier': tier,
@@ -352,14 +379,13 @@ def main():
                     buckets = ('early', 'mid', 'late')
                     print("  leave-one-event-out coverage (raw -> calibrated):")
                     for cl in args.confidence_levels:
-                        c = width_factors.get(cl, 1.0)
                         raw_all = _coverage_from_records(recs, cl, 1.0)[0]
-                        cal_all = _coverage_from_records(recs, cl, c)[0]
+                        cal_all = _coverage_per_bucket_factors(recs, cl, width_factors)[0]
                         per_bucket = ", ".join(
-                            f"{bk} {_coverage_from_records(recs, cl, c, bk)[0]*100:.0f}%"
+                            f"{bk} {_coverage_from_records(recs, cl, width_factors.get((bk, cl), 1.0), bk)[0]*100:.0f}%"
                             for bk in buckets
                         )
-                        print(f"    {cl}% (x{c:.2f}): overall {raw_all*100:.1f}% -> "
+                        print(f"    {cl}%: overall {raw_all*100:.1f}% -> "
                               f"{cal_all*100:.1f}%  [{per_bucket}]  (target {cl}%)")
 
         print(f"\nAll results saved to {args.output_dir}/")
