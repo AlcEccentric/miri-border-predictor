@@ -1199,6 +1199,7 @@ def _interval_cap_effective_ratio(
     skip_min_ratio: float = 0.0,
     skip_fast_weight_days: float = 0.0,
     skip_fast_ratio: float = 1.0,
+    skip_surge_alpha: float = 0.0,
 ) -> Optional[float]:
     """Interval-anchored per-idol cap.
 
@@ -1269,6 +1270,7 @@ def _interval_cap_effective_ratio(
             )
             if iR_pre is not None and np.isfinite(iR_pre) and iR_pre > 0:
                 m = float(skip_haircut_f)
+                _iR_post_obs = None
                 if steps_since >= 2:
                     iR_post = _idol_position_matched_interval_ratio(
                         search_df, target_event_id, float(target_idol_id), hist_ids,
@@ -1292,7 +1294,20 @@ def _interval_cap_effective_ratio(
                         full = max(1.0, wdays * day_steps)
                         w = min(1.0, float(steps_since) / full)
                         m = (1.0 - w) * float(skip_haircut_f) + w * r_obs
+                        _iR_post_obs = float(iR_post)
                 iR_base = m * iR_pre
+                # Surge credit: the r_obs cap (<=skip_max_ratio) pins iR_base at
+                # iR_pre for an idol whose OBSERVED post-crossing pace exceeds its
+                # pre-crossing pace, so a genuine post-2.4M accelerator is
+                # under-projected. Lift the base a fraction ``skip_surge_alpha`` of
+                # the way toward the observed pace. alpha<1 = partial trust (a fresh
+                # spike only leaks in by alpha). Anchor is the current (haircut)
+                # base so a brand-new crosser is not un-haircut and lifted at once.
+                # skip_surge_alpha=0.0 -> legacy hard-ceiling behavior. See
+                # docs/skip_surge_credit_design.md.
+                if (float(skip_surge_alpha) > 0.0 and _iR_post_obs is not None
+                        and _iR_post_obs > iR_pre):
+                    iR_base = iR_base + float(skip_surge_alpha) * (_iR_post_obs - iR_pre)
             # iR_pre uncomputable -> leave iR_base None, fall through to the
             # generic trailing-window estimator below.
         else:
@@ -1398,6 +1413,7 @@ def compute_macro_regime_scale_cap(
     interval_cap_skip_min_ratio: float = 0.0,
     interval_cap_skip_fast_weight_days: float = 0.0,
     interval_cap_skip_fast_ratio: float = 1.0,
+    interval_cap_skip_surge_alpha: float = 0.0,
     neighbor_daily_increments: Optional[np.ndarray] = None,
     total_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
@@ -1516,6 +1532,7 @@ def compute_macro_regime_scale_cap(
                 skip_min_ratio=interval_cap_skip_min_ratio,
                 skip_fast_weight_days=interval_cap_skip_fast_weight_days,
                 skip_fast_ratio=interval_cap_skip_fast_ratio,
+                skip_surge_alpha=interval_cap_skip_surge_alpha,
             )
             if eff is not None and np.isfinite(eff):
                 return (static_lower, max(eff, static_lower))

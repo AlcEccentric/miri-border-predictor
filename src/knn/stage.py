@@ -101,6 +101,7 @@ class StageParams:
     skip_observed_min_ratio: float
     skip_observed_fast_weight_days: float
     skip_observed_fast_ratio: float
+    skip_surge_alpha: float
 
 
 def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
@@ -185,6 +186,7 @@ def get_stage_params(config: GroupConfig, current_step: int) -> StageParams:
         skip_observed_min_ratio=getattr(config, "skip_observed_min_ratio", 0.0),
         skip_observed_fast_weight_days=getattr(config, "skip_observed_fast_weight_days", 0.0),
         skip_observed_fast_ratio=getattr(config, "skip_observed_fast_ratio", 1.0),
+        skip_surge_alpha=getattr(config, "skip_surge_alpha", 0.0),
     )
 
 

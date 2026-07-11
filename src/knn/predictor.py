@@ -478,6 +478,7 @@ def _predict_for_stage(
             interval_cap_skip_min_ratio=getattr(stage, "skip_observed_min_ratio", 0.0),
             interval_cap_skip_fast_weight_days=getattr(stage, "skip_observed_fast_weight_days", 0.0),
             interval_cap_skip_fast_ratio=getattr(stage, "skip_observed_fast_ratio", 1.0),
+            interval_cap_skip_surge_alpha=getattr(stage, "skip_surge_alpha", 0.0),
             neighbor_daily_increments=neighbor_daily_increments,
             # Normalized event length (full neighbour trajectories are all
             # norm_event_length long); used to size the forecast's remaining

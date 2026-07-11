@@ -507,6 +507,11 @@ class GroupConfig:
     # fast_weight_days<=0 disables (symmetric ramp).
     skip_observed_fast_weight_days: float = 0.0
     skip_observed_fast_ratio: float = 1.0
+    # Post-2.4M surge credit: lift iR_base a fraction of the way toward the
+    # observed post-crossing pace when it exceeds the pre-crossing pace (the
+    # r_obs cap otherwise pins accelerators at iR_pre). 0.0 = legacy hard cap.
+    # See docs/skip_surge_credit_design.md.
+    skip_surge_alpha: float = 0.0
 
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
@@ -927,6 +932,10 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         skip_observed_min_ratio=0.70,
         skip_observed_fast_weight_days=0.5,
         skip_observed_fast_ratio=0.95,
+        # 2026-07-11: credit a genuine post-2.4M acceleration (observed iR_post >
+        # pre-crossing iR_pre) instead of pinning it at iR_pre via the r_obs cap.
+        # alpha=0.15 = partial trust. See docs/skip_surge_credit_design.md.
+        skip_surge_alpha=0.15,
     )
 
 
