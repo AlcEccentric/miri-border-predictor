@@ -935,7 +935,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # 2026-07-11: credit a genuine post-2.4M acceleration (observed iR_post >
         # pre-crossing iR_pre) instead of pinning it at iR_pre via the r_obs cap.
         # alpha=0.15 = partial trust. See docs/skip_surge_credit_design.md.
-        skip_surge_alpha=0.15,
+        skip_surge_alpha=0.25,
     )
 
 
