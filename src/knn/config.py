@@ -980,7 +980,7 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # idol genuinely at peak pace now (最上静香) untouched. Only ever lowers.
         terminal_pace_cap_enabled=True,
         terminal_pace_cap_per_hour=48000.0,
-        terminal_pace_cap_obs_factor=0.9,
+        terminal_pace_cap_obs_factor=0.75,
         terminal_pace_cap_obs_window_hours=2.0,
         terminal_pace_cap_meas_lookback_hours=12.0,
         terminal_pace_cap_apply_last_hours=12.0,
