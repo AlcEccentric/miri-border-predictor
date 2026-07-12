@@ -184,6 +184,17 @@ def run_predictions(new_data: Dict[str, pd.DataFrame],
 
     logging.info(f"Sub event types: {sub_event_type}")
 
+    # Real-time span of the event (hours). The normalized 300-step grid is
+    # linear in wall-clock time, so downstream (terminal-pace cap) can derive
+    # hours-per-step = event_duration_hours / norm_event_length.
+    event_duration_hours = None
+    try:
+        _es = parser.isoparse(metadata['StartAt'])
+        _ee = parser.isoparse(metadata['EndAt'])
+        event_duration_hours = (_ee - _es).total_seconds() / 3600.0
+    except Exception:
+        logging.warning("Could not compute event_duration_hours from metadata; terminal-pace cap will be inert.")
+
     results = get_predictions(
         data=new_data,
         event_id=metadata['EventId'],
@@ -198,6 +209,7 @@ def run_predictions(new_data: Dict[str, pd.DataFrame],
         standard_event_boost_ratio=standard_event_boost_ratio,
         eid_to_len_boost_ratio=eid_to_len_boost_ratio,
         event_name_map=event_name_map,
+        event_duration_hours=event_duration_hours,
         r2_client=r2_client,
     )
     

@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import logging
@@ -36,6 +36,71 @@ def _apply_skip_haircut(arr: np.ndarray, first_pred_idx: int, crossing: float, f
         prev = start + inc_adj
         out[i] = prev
     return out
+
+
+def _max_rolling_rate_in_last_window(
+    values: np.ndarray,
+    hours_per_step: float,
+    window_hours: float,
+    lookback_hours: float,
+) -> float:
+    """Peak rolling per-hour gain over a ``window_hours`` window, measured only
+    within the LAST ``lookback_hours`` of the observed series.
+
+    ``values`` is the observed raw prefix on the uniform normalized grid (the
+    300-step grid is linear in wall-clock time, so consecutive samples are
+    ``hours_per_step`` apart). Used to set each idol's terminal-pace ceiling
+    from her recent (post-skip-exhaustion) demonstrated pace rather than an
+    early-event burst. Returns 0.0 when there isn't enough data."""
+    a = np.asarray(values, dtype=float)
+    n = len(a)
+    if n < 2 or hours_per_step <= 0:
+        return 0.0
+    w = max(1, int(round(window_hours / hours_per_step)))
+    lb = max(w + 1, int(round(lookback_hours / hours_per_step)))
+    lo = max(0, n - lb)
+    best = 0.0
+    # Full-width windows entirely inside the last-lookback slice.
+    for i in range(lo + w, n):
+        r = (a[i] - a[i - w]) / (w * hours_per_step)
+        if r > best:
+            best = r
+    # Fallback if the recent slice is shorter than one full window.
+    if best <= 0.0 and (n - 1) > lo:
+        dt = (n - 1 - lo) * hours_per_step
+        if dt > 0:
+            best = max(0.0, (a[-1] - a[lo]) / dt)
+    return best
+
+
+def _cap_terminal_pace(
+    raw_target: np.ndarray,
+    first_pred_idx: int,
+    hours_per_step: float,
+    cap_rate_per_hour: float,
+    apply_last_hours: float,
+) -> Tuple[np.ndarray, float]:
+    """Clip each FORECAST interval's per-step gain to ``cap_rate_per_hour`` over
+    the last ``apply_last_hours`` of the trajectory; excess is truncated and
+    carried forward (so the final value drops by the total removed). The
+    observed prefix (``raw_target[:first_pred_idx]``) and any forecast steps
+    before the apply window are untouched. Returns ``(capped_array, removed)``.
+    No-op (removed=0) when the trajectory never exceeds the ceiling."""
+    a = np.asarray(raw_target, dtype=float)
+    n = len(a)
+    if (first_pred_idx >= n or first_pred_idx < 1
+            or hours_per_step <= 0 or cap_rate_per_hour <= 0):
+        return a, 0.0
+    cap_step = cap_rate_per_hour * hours_per_step
+    apply_from = int(np.ceil((n - 1) - apply_last_hours / hours_per_step))
+    apply_from = max(first_pred_idx, apply_from, 1)
+    out = a.copy()
+    for i in range(apply_from, n):
+        inc = a[i] - a[i - 1]
+        capped = min(inc, cap_step) if inc > 0 else inc
+        out[i] = out[i - 1] + capped
+    removed = float(a[-1] - out[-1])
+    return out, removed
 
 
 def calculate_confidence_bounds(normalized_target: np.ndarray,
@@ -297,6 +362,13 @@ def build_result_dict(
     skip_crossing_score: float = 2_400_000.0,
     skip_haircut_f: float = 0.90,
     skip_observed_blend_enabled: bool = False,
+    terminal_pace_cap_enabled: bool = False,
+    terminal_pace_cap_per_hour: float = 48000.0,
+    terminal_pace_cap_obs_factor: float = 1.05,
+    terminal_pace_cap_obs_window_hours: float = 2.0,
+    terminal_pace_cap_meas_lookback_hours: float = 12.0,
+    terminal_pace_cap_apply_last_hours: float = 12.0,
+    event_duration_hours: Optional[float] = None,
 ) -> Dict:
     # Initialize result structure
     event_name = event_name_map[event_id]
@@ -502,6 +574,36 @@ def build_result_dict(
             raw_target, len(current_raw_data), skip_crossing_score, skip_haircut_f)
         _skip_applied = True
 
+    # Terminal-pace cap (see GroupConfig + _cap_terminal_pace). Bounds the
+    # forecast's implied per-hour pace in the last apply-window to the idol's
+    # recent demonstrated ceiling; only ever lowers. ``raw_target_precap`` is
+    # retained so the CI bounds can be rescaled to preserve their relative band
+    # around the new (capped) trajectory, keeping the validated final rel-error
+    # intact. hours-per-step = event_duration / len(raw_target) because the
+    # 300-step normalized grid is linear in wall-clock time.
+    _cap_applied = False
+    _cap_rate = None
+    raw_target_precap = raw_target
+    _hours_per_step = (event_duration_hours / len(raw_target)) if (event_duration_hours and len(raw_target) > 0) else None
+    if (terminal_pace_cap_enabled and _hours_per_step and _hours_per_step > 0
+            and len(current_raw_data) > 0 and len(raw_target) > len(current_raw_data)):
+        _obs_max = _max_rolling_rate_in_last_window(
+            current_raw_data, _hours_per_step,
+            terminal_pace_cap_obs_window_hours,
+            terminal_pace_cap_meas_lookback_hours)
+        _cap_rate = (min(terminal_pace_cap_per_hour, terminal_pace_cap_obs_factor * _obs_max)
+                     if _obs_max > 0 else terminal_pace_cap_per_hour)
+        raw_target_precap = raw_target.copy()
+        raw_target, _removed = _cap_terminal_pace(
+            raw_target, len(current_raw_data), _hours_per_step,
+            _cap_rate, terminal_pace_cap_apply_last_hours)
+        _cap_applied = _removed > 0
+        if _cap_applied:
+            logging.info(
+                f"Terminal-pace cap idol {idol_id} border {border}: "
+                f"cap={_cap_rate:,.0f}/h obs_max={_obs_max:,.0f}/h removed={_removed:,.0f} "
+                f"(final {raw_target_precap[-1]:,.0f} -> {raw_target[-1]:,.0f})")
+
     result["data"]["raw"]["target"] = [round(x) for x in raw_target.tolist()]
     
     # Denormalize bounds to raw scale for each CI level
@@ -529,9 +631,20 @@ def build_result_dict(
             standard_event_boost_ratio=standard_event_boost_ratio,
         )
         
+        _ru = _apply_skip_haircut(raw_upper, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_upper
+        _rl = _apply_skip_haircut(raw_lower, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_lower
+        if _cap_applied:
+            # Preserve each bound's relative offset to the (pre-cap) target so
+            # the validated final rel-error is unchanged, while the band scales
+            # down with the capped trajectory.
+            with np.errstate(divide='ignore', invalid='ignore'):
+                _ratio_u = np.where(raw_target_precap != 0, np.asarray(_ru, dtype=float) / raw_target_precap, 1.0)
+                _ratio_l = np.where(raw_target_precap != 0, np.asarray(_rl, dtype=float) / raw_target_precap, 1.0)
+            _ru = raw_target * _ratio_u
+            _rl = raw_target * _ratio_l
         raw_bounds[confidence_level] = {
-            "upper": [round(x) for x in (_apply_skip_haircut(raw_upper, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_upper).tolist()],
-            "lower": [round(x) for x in (_apply_skip_haircut(raw_lower, len(current_raw_data), skip_crossing_score, skip_haircut_f) if _skip_applied else raw_lower).tolist()]
+            "upper": [round(x) for x in np.asarray(_ru, dtype=float).tolist()],
+            "lower": [round(x) for x in np.asarray(_rl, dtype=float).tolist()]
         }
     
     result["data"]["raw"]["bounds"] = raw_bounds
@@ -663,6 +776,7 @@ def get_predictions(
     standard_event_boost_ratio: float,
     eid_to_len_boost_ratio: Dict,
     event_name_map: Dict,
+    event_duration_hours: Optional[float] = None,
     r2_client=None,
 ) -> Dict:
     results = {}
@@ -765,6 +879,13 @@ def get_predictions(
                     skip_crossing_score=getattr(_grp_cfg, "skip_crossing_score", 2_200_000.0),
                     skip_haircut_f=getattr(_grp_cfg, "skip_haircut_f", 0.90),
                     skip_observed_blend_enabled=getattr(_grp_cfg, "skip_observed_blend_enabled", False),
+                    terminal_pace_cap_enabled=getattr(_grp_cfg, "terminal_pace_cap_enabled", False),
+                    terminal_pace_cap_per_hour=getattr(_grp_cfg, "terminal_pace_cap_per_hour", 48000.0),
+                    terminal_pace_cap_obs_factor=getattr(_grp_cfg, "terminal_pace_cap_obs_factor", 1.05),
+                    terminal_pace_cap_obs_window_hours=getattr(_grp_cfg, "terminal_pace_cap_obs_window_hours", 2.0),
+                    terminal_pace_cap_meas_lookback_hours=getattr(_grp_cfg, "terminal_pace_cap_meas_lookback_hours", 12.0),
+                    terminal_pace_cap_apply_last_hours=getattr(_grp_cfg, "terminal_pace_cap_apply_last_hours", 12.0),
+                    event_duration_hours=event_duration_hours,
                 )
 
                 results[idol_id][border] = result

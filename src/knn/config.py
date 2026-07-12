@@ -513,6 +513,39 @@ class GroupConfig:
     # See docs/skip_surge_credit_design.md.
     skip_surge_alpha: float = 0.0
 
+    # --- Terminal-pace cap (default off) ---------------------------------
+    # Post-process on the raw target that bounds each FORECAST interval's
+    # implied per-hour pace within the last ``terminal_pace_cap_apply_last_hours``
+    # of the event. Per-idol ceiling:
+    #
+    #   cap_rate = min(terminal_pace_cap_per_hour,
+    #                  terminal_pace_cap_obs_factor
+    #                    * peak rolling-``obs_window_hours`` rate measured in the
+    #                      idol's LAST ``meas_lookback_hours`` of observed data)
+    #
+    # The measurement window is RECENT (last ~12h), NOT the whole event, on
+    # purpose: skip passes may be exhausted by the finale, so an early-event
+    # burst overstates current sustainable pace -- the recent peak reflects
+    # post-skip-exhaustion capability. Forecast increments exceeding the ceiling
+    # in the apply window are truncated (excess discarded -> final lowered),
+    # which fixes the neighbour-average dash shape that back-loads too steeply
+    # and projects an implausible closing burst for the hottest idols (e.g.
+    # 白石紬/桜守歌織 at ~55k/h uncapped). Only ever LOWERS a trajectory; an idol
+    # whose forecast never exceeds its ceiling is untouched. Orthogonal to the
+    # KNN/decay/skip machinery -- applied on the raw target AFTER denormalization
+    # and the skip haircut. Requires ``event_duration_hours`` (threaded from the
+    # production pipeline); inert in offline callers that don't pass it. Since
+    # the 300-step normalized grid is linear in wall-clock time, hours-per-step
+    # = event_duration_hours / len(raw_target) and the observed prefix
+    # (current_raw_data) is uniform on that grid. See _cap_terminal_pace /
+    # _max_rolling_rate_in_last_window in predict.py.
+    terminal_pace_cap_enabled: bool = False
+    terminal_pace_cap_per_hour: float = 48000.0
+    terminal_pace_cap_obs_factor: float = 1.05
+    terminal_pace_cap_obs_window_hours: float = 2.0
+    terminal_pace_cap_meas_lookback_hours: float = 12.0
+    terminal_pace_cap_apply_last_hours: float = 12.0
+
     early_stage_use_ensemble: bool = True
     mid_stage_use_ensemble: bool = True
     late_stage_use_ensemble: bool = False
@@ -936,6 +969,21 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         # pre-crossing iR_pre) instead of pinning it at iR_pre via the r_obs cap.
         # alpha=0.15 = partial trust. See docs/skip_surge_credit_design.md.
         skip_surge_alpha=0.15,
+        # 2026-07-12: terminal-pace cap ENABLED for border-100. Bounds the
+        # finale burst to min(48,000/h, 1.05 x each idol's peak-2h rate in her
+        # LAST 12h of observed data). Recent-window measurement (not peak-ever)
+        # so an early skip-pass-fuelled burst doesn't set the ceiling -- reflects
+        # post-skip capability. Fixes the neighbour-shape back-load that
+        # projected ~55k/h closes for 白石紬/桜守歌織 (physically implausible:
+        # >1.4x their own best 2h ever). Offline-validated on live event 437:
+        # trims the over-projected hot tail ~1-2% (白石 -1.3%), leaves the one
+        # idol genuinely at peak pace now (最上静香) untouched. Only ever lowers.
+        terminal_pace_cap_enabled=True,
+        terminal_pace_cap_per_hour=48000.0,
+        terminal_pace_cap_obs_factor=1.05,
+        terminal_pace_cap_obs_window_hours=2.0,
+        terminal_pace_cap_meas_lookback_hours=12.0,
+        terminal_pace_cap_apply_last_hours=12.0,
     )
 
 
