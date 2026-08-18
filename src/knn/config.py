@@ -100,6 +100,22 @@ class GroupConfig:
     mid_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
     late_stage_scale_cap: Tuple[float, float] = (0.8, 1.2)
 
+    # Endpoint blend between absolute aggregation (aligned-average of neighbour
+    # futures, frac=0) and relative aggregation (completion-fraction ÷g, frac=1),
+    # per stage. 0.0 = current behaviour (strict no-op).
+    early_stage_relative_frac: float = 0.0
+    mid_stage_relative_frac: float = 0.0
+    late_stage_relative_frac: float = 0.0
+
+    # ÷g pooling controls (only matter when a stage's relative_frac > 0).
+    # relative_pool_all: compute g over the FULL candidate pool with equal
+    # weight (ignores k-NN selection + distance weighting) -- best for sparse
+    # categories. relative_equal_weight: equal-weight the k neighbours instead
+    # of inverse-distance. Both default False = distance-weighted top-k.
+    relative_pool_all: bool = False
+    relative_equal_weight: bool = False
+    relative_pool_median: bool = False
+
     # Penalize candidates whose within-event standing (percentile rank among
     # idols in their own event, 0=best/highest score, 1=worst) differs a lot
     # from the target's own within-event standing at the same step. Distance
@@ -650,10 +666,16 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     
     # For Tiara & Trust
     configs[(3.0, (2.0,), 100.0)] = GroupConfig(
+        early_stage_relative_frac=1.0,
+        mid_stage_relative_frac=1.0,
+        late_stage_relative_frac=0.0,
+        relative_pool_all=False,
+        relative_equal_weight=True,
+        relative_pool_median=False,
         early_stage_end=160,
         mid_stage_end=220,
-        early_stage_k=5,
-        mid_stage_k=5,
+        early_stage_k=20,
+        mid_stage_k=13,
         late_stage_k=5,
         disable_scale=False,
         early_stage_lookback=50,
@@ -695,11 +717,15 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
     )
 
     configs[(3.0, (2.0,), 2500.0)] = GroupConfig(
+        early_stage_relative_frac=1.0,
+        mid_stage_relative_frac=1.0,
+        late_stage_relative_frac=1.0,
+        relative_equal_weight=True,
         early_stage_end=170,
         mid_stage_end=270,
-        early_stage_k=5,
-        mid_stage_k=5,
-        late_stage_k=5,
+        early_stage_k=15,
+        mid_stage_k=13,
+        late_stage_k=13,
         disable_scale=False,
         early_stage_lookback=50,
         mid_stage_lookback=35,

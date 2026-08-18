@@ -541,6 +541,69 @@ def _predict_for_stage(
             weights=soft_weights,
         )
 
+    # Optional relative (completion-fraction, ÷g) endpoint blend. For each
+    # neighbour, g_i = its value at current_step / its final; the relative
+    # final estimate is anchor / weighted_mean(g_i), using the SAME neighbour
+    # weights as the absolute path. The blend rescales only the future portion
+    # of the curve (from current_step on) so the observed part stays exact and
+    # the downstream cap/skip logic still sees a full trajectory.
+    # relative_frac = 0.0 (default) is a strict no-op.
+    rf = float(getattr(stage, "relative_frac", 0.0) or 0.0)
+    if rf > 0.0 and neighbor_full_list and current_step >= 1 and len(prediction) >= current_step:
+        # True observed current value at current_step (NOT prediction[current_step-1],
+        # which is the aligned-neighbour past and drifts above the real current).
+        _cs = np.asarray(sources.current_scores, dtype=float)
+        cur_true = float(_cs[min(current_step - 1, len(_cs) - 1)])
+        anchor = float(prediction[current_step - 1])  # curve-continuity anchor for the rescale
+        final_abs = float(prediction[-1])
+        # Pool + weighting for the ÷g estimate. relative_pool_all=True uses the
+        # FULL candidate pool with equal weight (ignores the k-NN selection and
+        # its distance weighting) -- the data-efficient estimator for sparse
+        # categories. relative_equal_weight=True keeps the k neighbours but
+        # weights them equally. Both default False (distance-weighted top-k).
+        _pool_all = bool(getattr(config, "relative_pool_all", False))
+        _equal = bool(getattr(config, "relative_equal_weight", False))
+        if _pool_all:
+            _fulls, _partials = fetch_neighbor_trajectories(
+                sources.prediction_full_df, sources.prediction_partial_df, candidate_ids,
+            )
+            _wsrc = np.ones(len(_fulls), dtype=float)
+        else:
+            _fulls, _partials = neighbor_full_list, neighbor_partial_list
+            if _equal:
+                _wsrc = np.ones(len(_fulls), dtype=float)
+            elif soft_weights is not None:
+                _wsrc = np.asarray(soft_weights, dtype=float)
+            elif len(distances) > 0:
+                _wsrc = 1.0 / (np.asarray(distances, dtype=float) + 1e-9)
+            else:
+                _wsrc = np.ones(len(_fulls), dtype=float)
+        _gs, _ws = [], []
+        for _f, _p, _wi in zip(_fulls, _partials, _wsrc):
+            _fin = float(_f[-1]) if len(_f) else 0.0
+            _cur = float(_p[min(current_step - 1, len(_p) - 1)]) if len(_p) else 0.0
+            if _fin > 0 and _cur > 0:
+                _gs.append(_cur / _fin); _ws.append(_wi)
+        denom = final_abs - anchor
+        if _gs and cur_true > 0 and denom > 0:
+            if bool(getattr(config, "relative_pool_median", False)):
+                _gbar = float(np.median(_gs))
+            else:
+                _gbar = float(np.average(_gs, weights=_ws))
+            if _gbar > 0:
+                final_rel = cur_true / _gbar
+                final_blend = (1.0 - rf) * final_abs + rf * final_rel
+                s = (final_blend - anchor) / denom
+                idx = np.arange(len(prediction))
+                mask = idx >= (current_step - 1)
+                blended = prediction.copy()
+                blended[mask] = anchor + (prediction[mask] - anchor) * s
+                prediction = blended
+                logging.debug(
+                    f"relfrac ev={event_id:.0f} step={current_step} n={len(_gs)} "
+                    f"cur={cur_true:.0f} gbar={_gbar:.5f} final_abs={final_abs:.0f} final_rel={final_rel:.0f}"
+                )
+
     if is_debug_logging():
         plot_neighbors_full_and_prediction(
             current_partial_data=np.array(current_scores_for_search),
