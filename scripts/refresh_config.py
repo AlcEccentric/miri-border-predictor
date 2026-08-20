@@ -50,6 +50,9 @@ from scripts.analyze_percentiles import (
     calibrate_width_factors,
     _inflate_interval,
     _step_bucket,
+    SAFETY_LEVELS,
+    analyze_safety_margins_for_group,
+    interpolate_safety_margins,
 )
 from scripts.batch_knn_test import BatchKNNTester
 from src.storage.dynamic_config import (
@@ -260,6 +263,14 @@ def build_ci_from_results(results_df: pd.DataFrame) -> pd.DataFrame:
                             for bk in ('early', 'mid', 'late'))
         logging.info(f"  CI width calibration (per-stage): {applied}")
     tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
+
+    # One-sided safety-line ladder (P70..P90), emitted as extra safety_<p>
+    # columns alongside the CI bounds. Additive: old readers ignore them.
+    safety_margins = analyze_safety_margins_for_group(results_df, SAFETY_LEVELS)
+    safety_interp = interpolate_safety_margins(
+        safety_margins, SAFETY_LEVELS, DEFAULT_START_STEP, DEFAULT_END_STEP,
+    )
+
     out_rows = []
     for step in range(DEFAULT_START_STEP, DEFAULT_END_STEP + 1):
         for tier in tiers:
@@ -269,13 +280,16 @@ def build_ci_from_results(results_df: pd.DataFrame) -> pd.DataFrame:
                     lower, upper = _inflate_interval(
                         interpolated[key],
                         width_factors.get((_step_bucket(step), cl), 1.0))
-                    out_rows.append({
+                    row = {
                         "step": step,
                         "tier": tier,
                         "confidence_level": cl,
                         "rel_error_lower_bound": lower,
                         "rel_error_upper_bound": upper,
-                    })
+                    }
+                    for p in SAFETY_LEVELS:
+                        row[f"safety_{p}"] = safety_interp.get((step, tier, p))
+                    out_rows.append(row)
     return pd.DataFrame(out_rows)
 
 

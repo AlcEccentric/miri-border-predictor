@@ -338,6 +338,68 @@ def load_confidence_intervals(
 
     return intervals_map
 
+
+def load_safety_margins(
+    event_type: float,
+    sub_type: float,
+    border: float,
+    step: int,
+    tier: int = 0,
+    r2_client=None,
+) -> Optional[Dict[int, float]]:
+    """Load one-sided safety-line margins ``{level: margin}`` for ``step`` from
+    the (cached) CI CSV's ``safety_<p>`` columns.
+
+    Returns ``None`` when the CSV has no ``safety_*`` columns (old CIs) so the
+    predictor appends nothing and the JSON stays byte-identical. Reuses the same
+    per-process CI cache and the same closest-step / tier-resolution behaviour as
+    ``load_confidence_intervals``.
+    """
+    from src.storage.loader import load_ci_csv_from_r2
+    from src.storage.r2_client import R2Client
+
+    cache_key = (float(event_type), float(sub_type), float(border))
+    if cache_key not in _CI_CACHE:
+        client = r2_client or R2Client()
+        _CI_CACHE[cache_key] = load_ci_csv_from_r2(client, event_type, sub_type, border)
+    df = _CI_CACHE[cache_key]
+
+    safety_cols = [c for c in df.columns if c.startswith('safety_')]
+    if not safety_cols:
+        return None
+
+    has_tier = 'tier' in df.columns
+    effective_tier = _resolve_tier(df, tier)
+
+    def _rows_for(step_value: int) -> pd.DataFrame:
+        if has_tier:
+            return df[(df['step'] == step_value) & (df['tier'] == effective_tier)]
+        return df[df['step'] == step_value]
+
+    step_data = _rows_for(step)
+    if step_data.empty:
+        available_steps = (df[df['tier'] == effective_tier]['step'].unique()
+                           if has_tier else df['step'].unique())
+        if len(available_steps) == 0:
+            return None
+        closest_step = min(available_steps, key=lambda x: abs(x - step))
+        if abs(closest_step - step) > 25:
+            return None
+        step_data = _rows_for(closest_step)
+
+    row = step_data.iloc[0]
+    margins: Dict[int, float] = {}
+    for c in safety_cols:
+        try:
+            level = int(c.split('_', 1)[1])
+        except (ValueError, IndexError):
+            continue
+        val = row[c]
+        if pd.notna(val):
+            margins[level] = float(val)
+    return margins or None
+
+
 def build_result_dict(
     event_id: int,
     event_type: float,
@@ -369,6 +431,7 @@ def build_result_dict(
     terminal_pace_cap_meas_lookback_hours: float = 12.0,
     terminal_pace_cap_apply_last_hours: float = 12.0,
     event_duration_hours: Optional[float] = None,
+    safety_margins: Optional[Dict[int, float]] = None,
 ) -> Dict:
     # Initialize result structure
     event_name = event_name_map[event_id]
@@ -648,6 +711,41 @@ def build_result_dict(
         }
     
     result["data"]["raw"]["bounds"] = raw_bounds
+
+    # One-sided safety lines (P70..P90 ladder). Uses the same normalized
+    # progress-ramp as the CI upper bound (via calculate_confidence_bounds with
+    # lower=0), then the identical denormalize + skip-haircut + cap-ratio path,
+    # keeping only the upper series. Appended only when the CI CSV carried
+    # safety_<p> columns; absent -> nothing added (JSON byte-identical).
+    if safety_margins:
+        safety_intervals = {int(lvl): (0.0, float(m)) for lvl, m in safety_margins.items()}
+        norm_safety = calculate_confidence_bounds(
+            normalized_target, len(current_norm_data) - 1, safety_intervals)
+        raw_safety: Dict[int, list] = {}
+        for lvl, nb in norm_safety.items():
+            r_up = denormalize_target_to_raw(
+                normalized_target=nb["upper"],
+                current_step=current_step,
+                current_raw_data=current_raw_data,
+                full_norm_length=norm_event_length,
+                standard_event_length=standard_event_length,
+                full_event_length=full_event_length,
+                actual_boost_start=actual_boost_start,
+                standard_event_boost_ratio=standard_event_boost_ratio,
+            )
+            if _skip_applied:
+                r_up = _apply_skip_haircut(
+                    r_up, len(current_raw_data), skip_crossing_score, skip_haircut_f)
+            if _cap_applied:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    _ratio = np.where(raw_target_precap != 0,
+                                      np.asarray(r_up, dtype=float) / raw_target_precap, 1.0)
+                r_up = raw_target * _ratio
+            raw_safety[lvl] = [round(x) for x in np.asarray(r_up, dtype=float).tolist()]
+        result["data"]["raw"]["safety"] = {
+            "levels": sorted(raw_safety.keys()),
+            **{str(lvl): arr for lvl, arr in raw_safety.items()},
+        }
     
     # Validate confidence bounds
     raw_bounds_arrays = {level: {"upper": np.array([x for x in bounds["upper"]]), "lower": np.array([x for x in bounds["lower"]])} for level, bounds in raw_bounds.items()}
@@ -664,6 +762,12 @@ def build_result_dict(
         for confidence_level in result["data"]["raw"]["bounds"]:
             result["data"]["raw"]["bounds"][confidence_level]["upper"] = [x - first_raw for x in result["data"]["raw"]["bounds"][confidence_level]["upper"]]
             result["data"]["raw"]["bounds"][confidence_level]["lower"] = [x - first_raw for x in result["data"]["raw"]["bounds"][confidence_level]["lower"]]
+
+        # Apply zero baseline to safety lines
+        if "safety" in result["data"]["raw"]:
+            for lvl in result["data"]["raw"]["safety"]["levels"]:
+                key = str(lvl)
+                result["data"]["raw"]["safety"][key] = [x - first_raw for x in result["data"]["raw"]["safety"][key]]
     
     if result["data"]["normalized"]["target"]:
         first_norm = result["data"]["normalized"]["target"][0]
@@ -685,6 +789,10 @@ def build_result_dict(
                 "upper_final": bounds["upper"][-1],
                 "lower_final": bounds["lower"][-1],
             }
+        if "safety" in result["data"]["raw"]:
+            for lvl in result["data"]["raw"]["safety"]["levels"]:
+                key = str(lvl)
+                result["data"]["raw"]["safety"][key] = result["data"]["raw"]["safety"][key][-1]
 
     # Final consistency check: compare normalized and denormalized final values
     norm_final = normalized_target[-1]
@@ -853,6 +961,11 @@ def get_predictions(
                     tier=tier_by_idol_border.get((int(idol_id), float(border)), 0),
                     r2_client=r2_client,
                 )
+                safety_margins = load_safety_margins(
+                    event_type, sub_type, border, step,
+                    tier=tier_by_idol_border.get((int(idol_id), float(border)), 0),
+                    r2_client=r2_client,
+                )
                 
                 _grp_cfg = get_group_config(float(event_type), (float(sub_type),), float(border))
                 result = build_result_dict(
@@ -886,6 +999,7 @@ def get_predictions(
                     terminal_pace_cap_meas_lookback_hours=getattr(_grp_cfg, "terminal_pace_cap_meas_lookback_hours", 12.0),
                     terminal_pace_cap_apply_last_hours=getattr(_grp_cfg, "terminal_pace_cap_apply_last_hours", 12.0),
                     event_duration_hours=event_duration_hours,
+                    safety_margins=safety_margins,
                 )
 
                 results[idol_id][border] = result

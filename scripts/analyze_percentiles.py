@@ -280,6 +280,80 @@ def _coverage_per_bucket_factors(recs, cl, factors):
     return (hit / tot if tot else float('nan')), tot
 
 
+# ---------------------------------------------------------------------------
+# One-sided safety lines (P70/75/80/85/90 ladder)
+# ---------------------------------------------------------------------------
+#
+# A safety line at level p is the target a player should aim for so that,
+# historically, the final border is at or below it p% of the time. It is the
+# p-quantile of r = actual/pred (the under-prediction tail), expressed as a
+# margin over the point prediction: margin_p = quantile_p(r) - 1. This is a
+# DIFFERENT quantity from the two-sided rel_error bounds (which are the over-
+# prediction band). r = 1/(1 + rel_error) since rel_error = (pred-actual)/actual.
+
+SAFETY_LEVELS = [70, 75, 80, 85, 90]
+
+
+def _one_sided_upper_quantile(values, p):
+    """Conformal upper p-quantile (finite-sample, outward-rounded) of ``values``."""
+    v = np.sort(np.asarray(values, dtype=float))
+    n = len(v)
+    if n == 0:
+        return None
+    k = int(np.ceil((n + 1) * (p / 100.0)))
+    k = min(max(k, 1), n)
+    return float(v[k - 1])
+
+
+def analyze_safety_margins_for_group(df_group, safety_levels=SAFETY_LEVELS):
+    """Per-(step, tier, level) one-sided safety margin from raw rel_errors.
+
+    ``margin_p = quantile_p(actual/pred) - 1`` where ``actual/pred = 1/(1+rel)``
+    and ``rel = relative_error/100``. Aiming at ``pred*(1+margin_p)`` covers the
+    final p% of the time historically. Returns ``{(step, tier, level): margin}``.
+    """
+    df = df_group.copy()
+    if 'tier' not in df.columns:
+        df['tier'] = 0
+    df = df.assign(_r=1.0 / (1.0 + df['relative_error'] / 100.0))
+    out = {}
+    for (step, tier), g in df.groupby(['step', 'tier']):
+        r = g['_r'].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(r) == 0:
+            continue
+        for p in safety_levels:
+            q = _one_sided_upper_quantile(r.values, p)
+            if q is not None:
+                out[(int(step), int(tier), int(p))] = q - 1.0
+    return out
+
+
+def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=299):
+    """Interpolate safety margins across ``[start_step, end_step]`` per (tier, level).
+
+    Returns ``{(step, tier, level): margin}``.
+    """
+    interpolated = {}
+    tiers = sorted({tier for (_step, tier, _p) in margins.keys()})
+    for tier in tiers:
+        for p in safety_levels:
+            pts = [(step, m) for (step, t, pp), m in margins.items() if t == tier and pp == p]
+            if len(pts) == 1:
+                for step in range(start_step, end_step + 1):
+                    interpolated[(step, tier, p)] = pts[0][1]
+                continue
+            if len(pts) < 2:
+                continue
+            steps = [x[0] for x in pts]
+            vals = [x[1] for x in pts]
+            f = interpolate.interp1d(
+                steps, vals, kind='linear', bounds_error=False, fill_value='extrapolate',
+            )
+            for step in range(start_step, end_step + 1):
+                interpolated[(step, tier, p)] = float(f(step))
+    return interpolated
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze confidence intervals of relative errors for all CSV files')
     parser.add_argument('--input-dir', default='test_results', help='Directory containing CSV files (default: test_results)')
@@ -295,6 +369,9 @@ def main():
     parser.add_argument('--coverage-margin', type=float, default=0.0,
                         help='extra coverage headroom above nominal when calibrating width '
                              '(e.g. 0.02 targets 92%% for a 90%% band)')
+    parser.add_argument('--safety-levels', nargs='+', type=int, default=SAFETY_LEVELS,
+                        help=f'one-sided safety-line levels to emit as safety_<p> columns '
+                             f'(default: {SAFETY_LEVELS}); pass empty to disable')
 
     args = parser.parse_args()
 
@@ -348,6 +425,18 @@ def main():
                 print(f"  width calibration (per-stage): {applied}")
 
             tiers = sorted({tier for (_step, tier, _cl) in interpolated.keys()})
+
+            # One-sided safety lines (P70..P90 ladder): margin_p over the point
+            # prediction, emitted as extra safety_<p> columns. Additive/ignored
+            # by readers that don't know them (old predict.py reads only the
+            # confidence_level + rel_error_* columns).
+            safety_interp = {}
+            if args.safety_levels:
+                safety_margins = analyze_safety_margins_for_group(df, args.safety_levels)
+                safety_interp = interpolate_safety_margins(
+                    safety_margins, args.safety_levels, args.start_step, args.end_step,
+                )
+
             output_data = []
             for step in range(args.start_step, args.end_step + 1):
                 for tier in tiers:
@@ -357,13 +446,16 @@ def main():
                             bounds = _inflate_interval(
                                 interpolated[key],
                                 width_factors.get((_step_bucket(step), confidence_level), 1.0))
-                            output_data.append({
+                            row = {
                                 'step': step,
                                 'tier': tier,
                                 'confidence_level': confidence_level,
                                 'rel_error_lower_bound': bounds[0],
                                 'rel_error_upper_bound': bounds[1],
-                            })
+                            }
+                            for p in args.safety_levels:
+                                row[f'safety_{p}'] = safety_interp.get((step, tier, p))
+                            output_data.append(row)
 
             if output_data:
                 output_df = pd.DataFrame(output_data)
