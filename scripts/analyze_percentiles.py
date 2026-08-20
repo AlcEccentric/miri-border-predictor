@@ -291,7 +291,7 @@ def _coverage_per_bucket_factors(recs, cl, factors):
 # DIFFERENT quantity from the two-sided rel_error bounds (which are the over-
 # prediction band). r = 1/(1 + rel_error) since rel_error = (pred-actual)/actual.
 
-SAFETY_LEVELS = [70, 75, 80, 85, 90]
+SAFETY_LEVELS = [70, 80, 90]
 
 
 def _one_sided_upper_quantile(values, p):
