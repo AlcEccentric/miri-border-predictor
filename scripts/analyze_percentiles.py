@@ -328,7 +328,11 @@ def analyze_safety_margins_for_group(df_group, safety_levels=SAFETY_LEVELS):
     return out
 
 
-def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=299):
+SAFETY_MIN_GAP = 0.01
+
+
+def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=299,
+                               min_gap=SAFETY_MIN_GAP):
     """Interpolate safety margins across ``[start_step, end_step]`` per (tier, level).
 
     Returns ``{(step, tier, level): margin}``.
@@ -351,7 +355,21 @@ def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=2
             )
             for step in range(start_step, end_step + 1):
                 interpolated[(step, tier, p)] = float(f(step))
-    return interpolated
+    return enforce_safety_min_gap(interpolated, safety_levels, start_step, end_step, min_gap)
+
+
+def enforce_safety_min_gap(margins, safety_levels, start_step, end_step, min_gap=SAFETY_MIN_GAP):
+    """Keep each safety level at least ``min_gap`` above the next lower level at every step."""
+    out = dict(margins)
+    levels = sorted(safety_levels)
+    tiers = sorted({tier for (_s, tier, _p) in margins.keys()})
+    for tier in tiers:
+        for prev, cur in zip(levels, levels[1:]):
+            for s in range(start_step, end_step + 1):
+                a, b = out.get((s, tier, prev)), out.get((s, tier, cur))
+                if a is not None and b is not None and b < a + min_gap:
+                    out[(s, tier, cur)] = a + min_gap
+    return out
 
 
 def main():
