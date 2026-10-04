@@ -624,6 +624,10 @@ def get_default_group_configs() -> Dict[Tuple[float, Tuple[float], float], Group
         mid_stage_use_smooth_for_prediction=False,
         late_stage_use_smooth_for_prediction=False,
         least_neighbor_id=275,
+        early_stage_relative_frac=0.5,
+        mid_stage_relative_frac=0.5,
+        late_stage_relative_frac=0.5,
+        relative_pool_all=True,
     )
 
     configs[(3.0, (1.0,), 2500.0)] = GroupConfig(
