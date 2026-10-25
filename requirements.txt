@@ -3,6 +3,7 @@ numpy
 scipy
 scikit-learn
 boto3
+certifi>=2026.10.19
 python-dotenv
 python-dateutil
 pytz
