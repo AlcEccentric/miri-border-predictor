@@ -10,7 +10,6 @@ behaviour applies (treated as ``tier=0``).
 
 import pandas as pd
 import numpy as np
-from scipy import interpolate
 import argparse
 import sys
 import glob
@@ -96,21 +95,15 @@ def interpolate_confidence_intervals(step_intervals, confidence_levels, start_st
             ]
             if len(step_data) < 2:
                 continue
+            step_data.sort(key=lambda item: item[0])
             steps = [item[0] for item in step_data]
             lower_bounds = [item[1][0] for item in step_data]
             upper_bounds = [item[1][1] for item in step_data]
-            lower_interp = interpolate.interp1d(
-                steps, lower_bounds, kind='linear',
-                bounds_error=False, fill_value='extrapolate',
-            )
-            upper_interp = interpolate.interp1d(
-                steps, upper_bounds, kind='linear',
-                bounds_error=False, fill_value='extrapolate',
-            )
             for step in range(start_step, end_step + 1):
+                # Linear between measured steps; hold edge values outside them.
                 interpolated[(step, tier, confidence_level)] = [
-                    float(lower_interp(step)),
-                    float(upper_interp(step)),
+                    float(np.interp(step, steps, lower_bounds)),
+                    float(np.interp(step, steps, upper_bounds)),
                 ]
 
     return interpolated
@@ -328,7 +321,7 @@ def analyze_safety_margins_for_group(df_group, safety_levels=SAFETY_LEVELS):
     return out
 
 
-SAFETY_MIN_GAP = 0.01
+SAFETY_MIN_GAP = 0.005
 
 
 def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=299,
@@ -348,13 +341,12 @@ def interpolate_safety_margins(margins, safety_levels, start_step=55, end_step=2
                 continue
             if len(pts) < 2:
                 continue
+            pts.sort(key=lambda x: x[0])
             steps = [x[0] for x in pts]
             vals = [x[1] for x in pts]
-            f = interpolate.interp1d(
-                steps, vals, kind='linear', bounds_error=False, fill_value='extrapolate',
-            )
             for step in range(start_step, end_step + 1):
-                interpolated[(step, tier, p)] = float(f(step))
+                # Linear between measured steps; hold edge values outside them.
+                interpolated[(step, tier, p)] = float(np.interp(step, steps, vals))
     return enforce_safety_min_gap(interpolated, safety_levels, start_step, end_step, min_gap)
 
 

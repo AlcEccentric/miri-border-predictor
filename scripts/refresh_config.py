@@ -97,10 +97,11 @@ def lookback_for_event_type(event_type: float) -> int:
         )
     return LOOK_BACK_EVENT_CNT_BY_TYPE[event_type]
 NORM_EVENT_LENGTH = 300
-DEFAULT_STEPS = [70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290]
-DEFAULT_CONFIDENCE_LEVELS = [75, 90]
-DEFAULT_START_STEP = 55
+DEFAULT_START_STEP = 50
 DEFAULT_END_STEP = 299
+# Backtest every step in the published range so no CI/safety value is extrapolated.
+DEFAULT_STEPS = list(range(DEFAULT_START_STEP, DEFAULT_END_STEP + 1))
+DEFAULT_CONFIDENCE_LEVELS = [75, 90]
 
 LOCAL_CACHE_DIR = Path("local_cache")
 LOCAL_EVENT_INFO_DIR = LOCAL_CACHE_DIR / "event_info"
