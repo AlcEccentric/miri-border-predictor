@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 import uuid
@@ -101,6 +102,8 @@ DEFAULT_START_STEP = 50
 DEFAULT_END_STEP = 299
 # Backtest every step in the published range so no CI/safety value is extrapolated.
 DEFAULT_STEPS = list(range(DEFAULT_START_STEP, DEFAULT_END_STEP + 1))
+# Steps per normalization batch; 12 matches the old grid's peak memory.
+STEP_CHUNK_SIZE = 12
 DEFAULT_CONFIDENCE_LEVELS = [75, 90]
 
 LOCAL_CACHE_DIR = Path("local_cache")
@@ -215,20 +218,26 @@ def run_batch_knn_for_group(
     test_event_ids = tester.find_matching_events(raw_data=raw_data, recent_count=None, test_event_ids=None)
     logging.info(f"  testing {len(test_event_ids)} events for group ({event_type},{sub_event_types},{border})")
 
-    length_to_df_data = tester.get_normalized_full_and_part_data(
-        raw_data=raw_data,
-        steps=DEFAULT_STEPS,
-        eid_to_len_boost_ratio=eid_to_len_boost_ratio,
-    )
     temp_idol_id = 1 if event_type == 5 else 0
-    results = tester.run_predictions(
-        test_event_ids=test_event_ids,
-        test_steps=DEFAULT_STEPS,
-        temp_idol_id=temp_idol_id,
-        raw_data=raw_data,
-        length_to_df_data=length_to_df_data,
-        eid_to_len_boost_ratio=eid_to_len_boost_ratio,
-    )
+    results = []
+    # Build per-step normalized frames in chunks to bound peak memory.
+    for i in range(0, len(DEFAULT_STEPS), STEP_CHUNK_SIZE):
+        chunk = DEFAULT_STEPS[i:i + STEP_CHUNK_SIZE]
+        length_to_df_data = tester.get_normalized_full_and_part_data(
+            raw_data=raw_data,
+            steps=chunk,
+            eid_to_len_boost_ratio=eid_to_len_boost_ratio,
+        )
+        results.extend(tester.run_predictions(
+            test_event_ids=test_event_ids,
+            test_steps=chunk,
+            temp_idol_id=temp_idol_id,
+            raw_data=raw_data,
+            length_to_df_data=length_to_df_data,
+            eid_to_len_boost_ratio=eid_to_len_boost_ratio,
+        ))
+        del length_to_df_data
+        gc.collect()
     return pd.DataFrame(results)
 
 
